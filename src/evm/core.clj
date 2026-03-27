@@ -2,7 +2,8 @@
   (:require
    [clojure.string :as string]
    [clojure.core.async :as async]
-   [com.rpl.specter :as specter])
+   [com.rpl.specter :as specter]
+   [malli.core :as malli])
   (:import
    [clojure.core.async.impl.channels ManyToManyChannel]))
 
@@ -30,7 +31,7 @@
          ([] ~type)
          ([payload#] (~name {} payload#))
          ([metadata# payload#]
-          ;; TODO: Validate payload# against schema
+          (malli/check ~schema payload#)
           {:event/type ~type
            :event/metadata (merge metadata# {:version ~v})
            :event/payload payload#})))))
