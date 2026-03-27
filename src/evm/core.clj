@@ -147,13 +147,9 @@
     (add-watch (:event-counter event-store)
                :w
                (fn [_key _ref current-sequence-num _next-sequence-num]
-                 (println "change" current-sequence-num)
                  (let [latest-event (specter/select-one
                                      (specter/walker #(= (get-in % [:event/metadata :sequence]) current-sequence-num))
                                      @(:events event-store))]
-                   (println "change 2")
-                   (println latest-event)
-                   (println (:event/type latest-event))
                    (when (and (get event-types (:event/type latest-event))
                               (has-bindings? latest-event tag-bindings))
                      (println "found event")
@@ -161,10 +157,6 @@
                        (println "removing watch")
                        (remove-watch (:event-counter event-store) :w))))))
     c))
-
-(comment
-  (get #{:a :b} :c)
-  )
 
 (defn in-memory-event-store
   []
@@ -259,7 +251,7 @@
   When a trigger occurs, the change fn is called with the event-store
   and the map of inputs."
   [event-store triggers body-fn]
-  (let [trigger-events (filter keyword? triggers)
+  (let [trigger-events (into #{} (filter keyword? triggers))
         trigger-event-tag-pairs (filter vector? triggers)
         trigger-channels (filter channel? triggers)
         stop-chan (async/chan 1)
@@ -349,16 +341,6 @@
   )
 
 (comment
-  (view* evs5 [[(a-event) (fn a-event-reducer [acc _e] (update acc :count (fnil inc 0)))]] {})
-  (view* evs5 [[[(a-event) {:foo "one"}] (fn a-event-reducer [acc _e] (update-in acc [:one :count] (fnil inc 0)))]
-               [[(a-event) {:foo "two"}] (fn a-event-reducer-no-tag [acc _e] (update-in acc [:two :count] (fnil inc 0)))]] {})
-  (view* evs5 [[[(a-event) {:foo "one"}] (fn a-event-reducer [acc _e] (update-in acc [:one :count] (fnil inc 0)))]
-               [[(a-event) {:foo "two"}] (fn a-event-reducer-no-tag [acc _e] (update-in acc [:two :count] (fnil inc 0)))]
-               [(b-event) (fn b-event-reducer [acc _e] (update-in acc [:b-count] (fnil inc 0)))]]
-         {:foo "one"})
-  )
-
-(comment
   (defview some-view {}
     (a-event)
     (fn a-reducer [acc _e]
@@ -379,7 +361,7 @@
     (automation evs5
                 #{(a-event)}
                 (fn [event-store]
-                  (let [counts (some-view event-store)]
+                  (let [counts (some-view event-store {})]
                     (test-change event-store counts)))))
 
   (stop-automation some-auto)
