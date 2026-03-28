@@ -3,7 +3,8 @@
    [clojure.string :as string]
    [clojure.core.async :as async]
    [com.rpl.specter :as specter]
-   [malli.core :as malli])
+   [malli.core :as malli]
+   [malli.error :as merror])
   (:import
    [clojure.core.async.impl.channels ManyToManyChannel]))
 
@@ -19,6 +20,16 @@
          event-type
          tags))
 
+(defn payload
+  "Build path to value in an event's payload."
+  [kw]
+  [:event/payload kw])
+
+(defn metadata
+  "Build path to value in an event's metadata."
+  [kw]
+  [:event/metadata kw])
+
 (defmacro defevent
   [name & {:keys [type version tags schema]}]
   (when-not type (throw (ex-info "Event definition must declare a type." {})))
@@ -31,10 +42,14 @@
          ([] ~type)
          ([payload#] (~name {} payload#))
          ([metadata# payload#]
-          (malli/check ~schema payload#)
-          {:event/type ~type
-           :event/metadata (merge metadata# {:version ~v})
-           :event/payload payload#})))))
+          (try
+            (malli/assert ~schema payload#)
+            {:event/type ~type
+             :event/metadata (merge metadata# {:version ~v})
+             :event/payload payload#}
+            (catch Exception e#
+              (throw (ex-info "Event does not match schema."
+                              (-> e# ex-data :data :explain malli.error/humanize))))))))))
 
 (defn get-event-tags
   ([event-type]
@@ -50,24 +65,35 @@
   [event]
   (:event/metadata event))
 
-(defn- keyword->string
-  [kw]
-  (if-let [prefix (namespace kw)]
-    (str prefix "__" (name kw))
-    (name kw)))
+(defn- tag-path->string
+  [tag-path]
+  ;; (assert (= 2 (count tag-path)) "tag-path must be a pair")
+  (let [kw (last tag-path)]
+    (if-let [prefix (namespace kw)]
+      (str prefix "__" (name kw))
+      (name kw))))
 
 (defn event-path-vec
   [event-type tag-bindings]
   (let [tags (get-event-tags event-type)
         tags-with-data (mapcat
-                        (fn [tag] [(keyword->string tag) (get tag-bindings tag "*")])
+                        (fn [tag] [(tag-path->string tag) (get tag-bindings tag "*")])
                         tags)]
-    (into [(keyword->string event-type)] tags-with-data)))
+    (into [(tag-path->string [event-type])] tags-with-data)))
+
+(defn event->tag-bindings
+  [event]
+  (let [tags (get-event-tags (event-type event))]
+    (reduce
+     (fn [acc tag]
+       (assoc acc tag (get-in event tag)))
+     {}
+     tags)))
 
 (defn event-append-path
   "Compute the file system path for the event's stream."
   [event]
-  (string/join "/" (event-path-vec (:event/type event) (:event/payload event))))
+  (string/join "/" (event-path-vec (event-type event) (event->tag-bindings event))))
 
 (defn event-read-path
   "Compute the file system path for reading the event stream of event-type. Can contain globs."
@@ -77,7 +103,7 @@
 (defn event-append-subject
   "Compute the NATS subject for the event."
   [event]
-  (string/join "." (event-path-vec (:event/type event) (:event/payload event))))
+  (string/join "." (event-path-vec (:event/type event) (event->tag-bindings event))))
 
 (defn event-read-subject
   "Compute the NATS subject filter for the event type. Can contain wildcards."
@@ -106,7 +132,6 @@
   (let [all-events @(:events event-store)
         event-paths (map
                      (fn [event-type]
-                       (println event-type)
                        (event-path-vec event-type tag-bindings))
                      event-types)]
     (->> event-paths
@@ -117,9 +142,13 @@
 
 (defn- in-memory-append
   [event-store event]
-  (let [event-path (event-path-vec (:event/type event) (:event/payload event))]
+  (let [event-path (event-path-vec (:event/type event) (event->tag-bindings event))]
     (dosync
-     (alter (:events event-store) update-in event-path (fnil conj []) (assoc-in event [:event/metadata :sequence] @(:event-counter event-store)))
+     (alter (:events event-store)
+            update-in
+            event-path
+            (fnil conj [])
+            (assoc-in event [:event/metadata :sequence] @(:event-counter event-store)))
      (alter (:event-counter event-store) inc))))
 
 (defn has-bindings?
@@ -131,16 +160,19 @@
        (= "*" v)
        acc
 
-       (= ::not-found (get-in event [:event/payload k] ::not-found))
+       (= ::not-found (get-in event k ::not-found))
        acc
 
-       (= v (get-in event [:event/payload k]))
+       (= v (get-in event k))
        true
 
        :else
        (reduced false)))
    true
    tag-bindings))
+
+(defn- sequence-num [event]
+  (get-in event [:event/metadata :sequence]))
 
 (defn- in-memory-subscribe
   [event-store event-types tag-bindings]
@@ -149,7 +181,7 @@
                :w
                (fn [_key _ref current-sequence-num _next-sequence-num]
                  (let [latest-event (specter/select-one
-                                     (specter/walker #(= (get-in % [:event/metadata :sequence]) current-sequence-num))
+                                     (specter/walker #(= (sequence-num %) current-sequence-num))
                                      @(:events event-store))]
                    (when (and (get event-types (:event/type latest-event))
                               (has-bindings? latest-event tag-bindings))
@@ -213,8 +245,6 @@
   Will throw in case an event is sourced for which there is no
   reducer-fn registered."
   [event-store binding-pairs tag-bindings initial-acc]
-  (println binding-pairs)
-  (println tag-bindings)
   (let [events (source event-store (into #{} (map binding-pair-type) binding-pairs) tag-bindings)]
     (reduce
      (fn [acc event]
@@ -229,7 +259,6 @@
   [name initial-acc & binding-pairs]
   (assert (even? (count binding-pairs)) "defview requires an even number of binding pairs.")
   (let [binding-pairs-seq (into [] (partitionv 2 binding-pairs))]
-    (println binding-pairs-seq)
     `(do
        (defn
          ^{:state-view true}
@@ -291,7 +320,6 @@
       (assert (= (when-fn event-store payload) then)
               description)
       (let [new-events (source event-store (into #{} (map :event/type then)) {})]
-        (println new-events)
         (assert (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
                    (map (fn [e] (select-keys e #{:event/type :event/payload})) then))
                 description)))))
@@ -299,23 +327,32 @@
 (comment
 
   (a-event)
-  (a-event {:entity/id "foobar" :foo "one"})
+  (a-event {:entity/id "foobar" :fo "one"})
   (a-event {:correlation-id 123} {:entity/id "foobar" :foo "one"})
   (event-append-path (a-event {} {:entity/id "foobar" :foo "one"}))
-  (event-read-path (a-event) {:entity/id "test" :foo "notme"})
+  (event-read-path (a-event) {(payload :entity/id) "test" (payload :foo) "notme"})
   (event-append-subject (a-event {} {:entity/id "foobar" :foo "one"}))
-  (event-read-subject (a-event) {:foo "yesman"})
+  (event-read-subject (a-event) {(payload :foo) "yesman"})
   (defevent a-event
     :type :test/a
     :version 1
-    :tags [:entity/id :foo]
+    :tags [(metadata :version) (payload :entity/id) (payload :foo)]
     :schema [:map
              [:entity/id :string]
+             [:foo :string]])
+
+  (defevent a-event-v2
+    :type :test/a
+    :version 2
+    :tags [(metadata :version) (payload :entity/id) (payload :foo)]
+    :schema [:map
+             [:entity/id :string]
+             [:new-key :int]
              [:foo :string]])
   (defevent b-event
     :type :test/b
     :version 1
-    :tags [:entity/id]
+    :tags [(payload :entity/id)]
     :schema [:map
              [:entity/id :string]
              [:bar :string]])
@@ -323,7 +360,7 @@
 
 (comment
   (def evs5 (in-memory-event-store))
-  (def sub-c (subscribe evs5 #{(a-event) (b-event)} {:entity/id "foobar" :foo "two" :bar "*"}))
+  (def sub-c (subscribe evs5 #{(a-event) (b-event)} {(payload :entity/id) "foobar" (payload :foo) "two" (payload :bar) "*"}))
 
   (def go-c (async/go-loop []
               (when-let [v (async/<! sub-c)]
@@ -336,16 +373,21 @@
   (append evs5 (a-event {:entity/id "foobar" :foo "two"}))
   (append evs5 (b-event {:entity/id "foobar" :bar "snaz"}))
   (append evs5 (a-event {:entity/id "snaz" :foo "two"}))
+  (append evs5 (a-event-v2 {:entity/id "foobar" :foo "one" :new-key 42}))
 
-  (count (source evs5 #{(a-event)} {:foo "two"}))
+  (count (source evs5 #{(a-event)} {(payload :foo) "two"}))
   (count (source evs5 #{(a-event)} {}))
   )
 
 (comment
   (defview some-view {}
-    (a-event)
+    [(a-event) {(metadata :version) 1}]
     (fn a-reducer [acc _e]
-      (update acc :count (fnil inc 0)))
+      (update acc :count-v1 (fnil inc 0)))
+
+    [(a-event) {(metadata :version) 2}]
+    (fn a-reducer [acc _e]
+      (update acc :count-v2 (fnil inc 0)))
 
     (b-event)
     (fn b-reducer [acc _e]
