@@ -1,0 +1,1 @@
+{:lint-as {evm.core/defevent clojure.core/def, evm.core/defview clojure.core/def}}
