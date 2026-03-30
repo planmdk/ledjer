@@ -4,7 +4,8 @@
    [clojure.core.async :as async]
    [com.rpl.specter :as specter]
    [malli.core :as malli]
-   [malli.error :as merror])
+   [malli.error :as merror]
+   [clojure.test :as test])
   (:import
    [clojure.core.async.impl.channels ManyToManyChannel]))
 
@@ -21,16 +22,25 @@
          tags))
 
 (defn payload
+  [event]
+  (:event/payload event))
+
+(defn metadata
+  [event]
+  (:event/metadata event))
+
+(defn payload-path
   "Build path to value in an event's payload."
   [kw]
   [:event/payload kw])
 
-(defn metadata
+(defn metadata-path
   "Build path to value in an event's metadata."
   [kw]
   [:event/metadata kw])
 
 (defmacro defevent
+  {:clj-kondo/lint-as 'clojure.core/def}
   [name & {:keys [type version tags schema]}]
   (when-not type (throw (ex-info "Event definition must declare a type." {})))
   (when-not schema (throw (ex-info "Event definition must declare a schema." {})))
@@ -60,10 +70,6 @@
 (defn event-type
   [event]
   (:event/type event))
-
-(defn event-metadata
-  [event]
-  (:event/metadata event))
 
 (defn- tag-path->string
   [tag-path]
@@ -236,7 +242,7 @@
       (throw (ex-info "Expected exactly one matching binding pair per event!" {:num-matching (count pairs-matching-type)}))
       (binding-pair-reducer (first pairs-matching-type)))))
 
-(defn- view*
+(defn view*
   "Given a map of binding-pairs, either kw -> reducer-fn or [kw
   tag-bindings] -> reducer-fn, and a map of tag-bindings, reduces
   events sourced from event-store to a single value using the
@@ -256,6 +262,7 @@
 (defmacro defview
   "Define a state view, a function of an event-store and a map of tag
   bindings."
+  {:clj-kondo/lint-as 'clojure.core/def}
   [name initial-acc & binding-pairs]
   (assert (even? (count binding-pairs)) "defview requires an even number of binding pairs.")
   (let [binding-pairs-seq (into [] (partitionv 2 binding-pairs))]
@@ -266,7 +273,15 @@
          [event-store# tag-bindings#]
          (view* event-store# ~binding-pairs-seq tag-bindings# ~initial-acc)))))
 
-
+(defn periodic
+  "Helper to create periodic ticks, useful as triggers for automations."
+  [ms]
+  (let [out-c (async/chan 1)]
+    (async/go-loop []
+      (let [_ (async/<! (async/timeout ms))]
+        (when (async/>! out-c :tick)
+          (recur))))
+    out-c))
 
 (defn- channel?
   [v]
@@ -302,27 +317,29 @@
       (when-not (= p stop-chan)
         (body-fn event-store)
         (recur (async/alts! trigger-chans))))
-    stop-chan))
+    (fn []
+      (async/close! stop-chan))))
 
 (defn stop-automation
   [automation]
   (async/close! automation))
 
-(defn gwt
-  [& {:keys [description given when then]}]
-  (assert (var? (first when)) "The first element of the :when must be a var. Did you forget to prepend #' or wrap it in (var)?")
+(defn gwt*
+  [& {:keys [given when then]}]
+  #_(assert (var? (first when)) "The first element of the :when must be a var. Did you forget to prepend #' or wrap it in (var)?")
   (let [event-store (in-memory-event-store)
         [when-fn payload] when]
     (doseq [g given]
       (append event-store g))
-    (when-fn event-store payload)
-    (if (:state-view (meta when-fn))
-      (assert (= (when-fn event-store payload) then)
-              description)
-      (let [new-events (source event-store (into #{} (map :event/type then)) {})]
-        (assert (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
-                   (map (fn [e] (select-keys e #{:event/type :event/payload})) then))
-                description)))))
+    (if (instance? java.util.regex.Pattern then)
+      (test/is (thrown-with-msg? clojure.lang.ExceptionInfo then (when-fn event-store payload)))
+      (do
+        (when-fn event-store payload)
+        (if (:view (meta when-fn))
+          (test/is (= (when-fn event-store payload) then))
+          (let [new-events (source event-store (into #{} (map :event/type then)) {})]
+            (test/is (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
+                        (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
 
 (comment
 
@@ -330,13 +347,13 @@
   (a-event {:entity/id "foobar" :fo "one"})
   (a-event {:correlation-id 123} {:entity/id "foobar" :foo "one"})
   (event-append-path (a-event {} {:entity/id "foobar" :foo "one"}))
-  (event-read-path (a-event) {(payload :entity/id) "test" (payload :foo) "notme"})
+  (event-read-path (a-event) {(payload-path :entity/id) "test" (payload-path :foo) "notme"})
   (event-append-subject (a-event {} {:entity/id "foobar" :foo "one"}))
-  (event-read-subject (a-event) {(payload :foo) "yesman"})
+  (event-read-subject (a-event) {(payload-path :foo) "yesman"})
   (defevent a-event
     :type :test/a
     :version 1
-    :tags [(metadata :version) (payload :entity/id) (payload :foo)]
+    :tags [(metadata-path :version) (payload-path :entity/id) (payload-path :foo)]
     :schema [:map
              [:entity/id :string]
              [:foo :string]])
@@ -344,7 +361,7 @@
   (defevent a-event-v2
     :type :test/a
     :version 2
-    :tags [(metadata :version) (payload :entity/id) (payload :foo)]
+    :tags [(metadata-path :version) (payload-path :entity/id) (payload-path :foo)]
     :schema [:map
              [:entity/id :string]
              [:new-key :int]
@@ -352,7 +369,7 @@
   (defevent b-event
     :type :test/b
     :version 1
-    :tags [(payload :entity/id)]
+    :tags [(payload-path :entity/id)]
     :schema [:map
              [:entity/id :string]
              [:bar :string]])
@@ -360,7 +377,7 @@
 
 (comment
   (def evs5 (in-memory-event-store))
-  (def sub-c (subscribe evs5 #{(a-event) (b-event)} {(payload :entity/id) "foobar" (payload :foo) "two" (payload :bar) "*"}))
+  (def sub-c (subscribe evs5 #{(a-event) (b-event)} {(payload-path :entity/id) "foobar" (payload-path :foo) "two" (payload-path :bar) "*"}))
 
   (def go-c (async/go-loop []
               (when-let [v (async/<! sub-c)]
@@ -375,17 +392,17 @@
   (append evs5 (a-event {:entity/id "snaz" :foo "two"}))
   (append evs5 (a-event-v2 {:entity/id "foobar" :foo "one" :new-key 42}))
 
-  (count (source evs5 #{(a-event)} {(payload :foo) "two"}))
+  (count (source evs5 #{(a-event)} {(payload-path :foo) "two"}))
   (count (source evs5 #{(a-event)} {}))
   )
 
 (comment
   (defview some-view {}
-    [(a-event) {(metadata :version) 1}]
+    [(a-event) {(metadata-path :version) 1}]
     (fn a-reducer [acc _e]
       (update acc :count-v1 (fnil inc 0)))
 
-    [(a-event) {(metadata :version) 2}]
+    [(a-event) {(metadata-path :version) 2}]
     (fn a-reducer [acc _e]
       (update acc :count-v2 (fnil inc 0)))
 
@@ -416,18 +433,17 @@
     (when (= (:op payload) "combine")
       (let [a-events (source event-store #{(a-event)} {:entity/id (:entity/id payload)})
             the-bar (string/join "" (map (comp :foo :event/payload) a-events))]
+        #_(throw (ex-info "Foobar" {}))
         (append event-store (b-event {:entity/id (:entity/id payload) :bar the-bar})))))
 
-  (gwt
-   :description "Combine op change combines foos"
+  (gwt*
    :given [(a-event {:entity/id "1" :foo "one"})
            (a-event {:entity/id "1" :foo "two"})]
-   :when [#'test-change {:op "combine" :entity/id "1"}]
-   :then [(b-event {:entity/id "1" :bar "onetwo"})])
+   :when [test-change {:op "combine" :entity/id "1"}]
+   :then #_#"Foobar"[(b-event {:entity/id "1" :bar "onetwo"})])
 
 
-  (gwt
-   :description "some-view counts"
+  (gwt*
    :given [(a-event {:entity/id "1" :foo "one"})]
-   :when [#'some-view {}]
+   :when [some-view {}]
    :then {:count 1}))
