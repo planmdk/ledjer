@@ -83,7 +83,8 @@
   [event-type tag-bindings]
   (let [tags (get-event-tags event-type)
         tags-with-data (mapcat
-                        (fn [tag] [(tag-path->string tag) (get tag-bindings tag "*")])
+                        (fn [tag]
+                          [(tag-path->string tag) (get tag-bindings tag "*")])
                         tags)]
     (into [(tag-path->string [event-type])] tags-with-data)))
 
@@ -328,15 +329,15 @@
   [& {:keys [given when then]}]
   #_(assert (var? (first when)) "The first element of the :when must be a var. Did you forget to prepend #' or wrap it in (var)?")
   (let [event-store (in-memory-event-store)
-        [when-fn payload] when]
+        [when-fn & payload] when]
     (doseq [g given]
       (append event-store g))
     (if (instance? java.util.regex.Pattern then)
-      (test/is (thrown-with-msg? clojure.lang.ExceptionInfo then (when-fn event-store payload)))
-      (do
-        (when-fn event-store payload)
-        (if (:view (meta when-fn))
-          (test/is (= (when-fn event-store payload) then))
+      (test/is (thrown-with-msg? clojure.lang.ExceptionInfo then (apply when-fn event-store payload)))
+      (if (:state-view (meta when-fn))
+        (test/is (= (apply when-fn event-store payload) then))
+        (do
+          (apply when-fn event-store payload)
           (let [new-events (source event-store (into #{} (map :event/type then)) {})]
             (test/is (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
