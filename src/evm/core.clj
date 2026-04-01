@@ -327,7 +327,7 @@
 
 (defn gwt*
   [& {:keys [given when then]}]
-  #_(assert (var? (first when)) "The first element of the :when must be a var. Did you forget to prepend #' or wrap it in (var)?")
+  (assert (var? (first when)) "The first element of the :when must be a var. Did you forget to prepend #' or wrap it in (var)?")
   (let [event-store (in-memory-event-store)
         [when-fn & payload] when]
     (doseq [g given]
@@ -341,6 +341,32 @@
           (let [new-events (source event-store (into #{} (map :event/type then)) {})]
             (test/is (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
+
+(defn gt
+  [& {:keys [automation given then timeout-ms]}]
+  (let [event-store (in-memory-event-store)
+        automation-stop-fn (automation event-store)]
+    (try
+      (doseq [g given]
+        (append event-store g))
+      (let [timeout-ch (async/timeout (or timeout-ms 1000))
+            new-events-ch (async/take
+                           (count then)
+                           (subscribe event-store (into #{} (map event-type then)) {}))
+            go-ch (async/go-loop [[t & thens] then
+                                  ev (async/<! new-events-ch)]
+                    (when ev
+                      (test/is (= (select-keys ev #{:event/type :event/payload})
+                                  (select-keys t #{:event/type :event/payload})))
+                      (when (seq thens)
+                        (recur thens (async/<! new-events-ch)))))]
+        (when (= :timed-out
+                 (async/alt!!
+                   timeout-ch :timed-out
+                   go-ch :ran))
+          (throw (ex-info "Given-Then timed out." {:timeout-ms timeout-ms}))))
+      (finally
+        (automation-stop-fn)))))
 
 (comment
 
