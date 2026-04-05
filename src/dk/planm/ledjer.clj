@@ -1,4 +1,4 @@
-(ns evm.core
+(ns dk.planm.ledjer
   (:require
    [clojure.string :as string]
    [clojure.core.async :as async]
