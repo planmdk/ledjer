@@ -9,7 +9,7 @@
   (:import
    [clojure.core.async.impl.channels ManyToManyChannel]))
 
-(def event-tag-registry (atom {}))
+(defonce event-tag-registry (atom {}))
 
 (defn register-event-tags
   [event-type tags]
@@ -119,9 +119,18 @@
 
 (defprotocol EventStore
   :extend-via-metadata true
-  (source [this event-types tag-bindings])
-  (subscribe [this event-types tag-bindings])
-  (append [this event]))
+  (-source [this event-types tag-bindings opts])
+  (-subscribe [this event-types tag-bindings])
+  (-append [this event]))
+
+(defn source [event-store event-types tag-bindings & opts]
+  (-source event-store event-types tag-bindings opts))
+
+(defn subscribe [event-store event-types tag-bindings]
+  (-subscribe event-store event-types tag-bindings))
+
+(defn append [event-store event]
+  (-append event-store event))
 
 (defn- get-in*
   "Like get-in but supports wildcards (\"*\")"
@@ -135,28 +144,34 @@
    m))
 
 (defn- in-memory-source
-  [event-store event-types tag-bindings]
-  (let [all-events @(:events event-store)
+  [event-store event-types tag-bindings opts]
+  (let [{:keys [start-sequence]} opts
+        all-events @(:events event-store)
         event-paths (map
                      (fn [event-type]
                        (event-path-vec event-type tag-bindings))
                      event-types)]
-    (->> event-paths
-         (mapcat (fn [path] (get-in* all-events path)))
-         (filter (comp not nil?))
-         (flatten)
-         (sort-by (fn [ev] (get-in ev [:event/metadata :sequence]))))))
+    (let [events (->> event-paths
+                      (mapcat (fn [path] (get-in* all-events path)))
+                      (filter (comp not nil?))
+                      (flatten)
+                      (sort-by (fn [ev] (get-in ev [:event/metadata :sequence]))))]
+      (if start-sequence
+        (into [] (drop-while (fn [e] (< (:sequence (metadata e)) start-sequence))) events)
+        events))))
 
 (defn- in-memory-append
   [event-store event]
   (let [event-path (event-path-vec (:event/type event) (event->tag-bindings event))]
     (dosync
-     (alter (:events event-store)
-            update-in
-            event-path
-            (fnil conj [])
-            (assoc-in event [:event/metadata :sequence] @(:event-counter event-store)))
-     (alter (:event-counter event-store) inc))))
+     (let [e (assoc-in event [:event/metadata :sequence] @(:event-counter event-store))]
+       (alter (:events event-store)
+              update-in
+              event-path
+              (fnil conj [])
+              e)
+       (alter (:event-counter event-store) inc)
+       e))))
 
 (defn has-bindings?
   "Test if event has values matching the tag-bindings map, respecting wildcards."
@@ -203,9 +218,9 @@
   (with-meta
     {:events (ref {})
      :event-counter (ref 0)}
-    {`source #'in-memory-source
-     `append #'in-memory-append
-     `subscribe #'in-memory-subscribe}))
+    {`-source #'in-memory-source
+     `-append #'in-memory-append
+     `-subscribe #'in-memory-subscribe}))
 
 (defn- binding-pair-type
   "Get the event type from a state view binding pair."
@@ -329,16 +344,18 @@
   [& {:keys [given when then]}]
   (assert (var? (first when)) "The first element of the :when must be a var. Did you forget to prepend #' or wrap it in (var)?")
   (let [event-store (in-memory-event-store)
-        [when-fn & payload] when]
+        [when-fn & payload] when
+        start-sequence (atom 0)]
     (doseq [g given]
-      (append event-store g))
+      (let [e (append event-store g)]
+        (reset! start-sequence (:sequence (metadata e)))))
     (if (instance? java.util.regex.Pattern then)
       (test/is (thrown-with-msg? clojure.lang.ExceptionInfo then (apply when-fn event-store payload)))
       (if (:state-view (meta when-fn))
         (test/is (= (apply when-fn event-store payload) then))
         (do
           (apply when-fn event-store payload)
-          (let [new-events (source event-store (into #{} (map :event/type then)) {})]
+          (let [new-events (source event-store (into #{} (map :event/type then)) {} :start-sequence @start-sequence)]
             (test/is (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
 
