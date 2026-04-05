@@ -1,0 +1,1 @@
+{:lint-as {dk.planm.ledjer/defevent clojure.core/def, dk.planm.ledjer/defview clojure.core/def}}

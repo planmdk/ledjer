@@ -1,45 +1,40 @@
 (ns dk.planm.ledjer
+  "# Ledjer
+
+  A small event sourcing library aiming to minimize the gap between
+  Event Models (https://eventmodeling.org/) and corresponding event
+  sourced applications.
+
+  The concepts in Event Modeling map almost directly to concepts in Ledjer:
+
+  - state view: (defview ...)
+  - automation: (automation ...)
+  - event: (defevent ...)
+  - state change: defn that either fails or appends events
+  - GWT: (gwt ...)
+  - GT: (gt ...)
+
+  Ledjer is opinionated. "
   (:require
-   [clojure.string :as string]
    [clojure.core.async :as async]
-   [com.rpl.specter :as specter]
+   [clojure.string :as string]
+   [clojure.test :as test]
+   [dk.planm.ledjer.event :as event]
+   [dk.planm.ledjer.protocols :as p]
+   [dk.planm.ledjer.store.memory :as store.memory]
    [malli.core :as malli]
-   [malli.error :as merror]
-   [clojure.test :as test])
+   [malli.error :as merror])
   (:import
    [clojure.core.async.impl.channels ManyToManyChannel]))
 
-(defonce event-tag-registry (atom {}))
-
-(defn register-event-tags
-  [event-type tags]
-  (swap! event-tag-registry
-         (fn [registry et ts]
-           (when (get registry et)
-             (tap> ["event-type already registered" {:event/type et}]))
-           (assoc registry et ts))
-         event-type
-         tags))
-
-(defn payload
-  [event]
-  (:event/payload event))
-
-(defn metadata
-  [event]
-  (:event/metadata event))
-
-(defn payload-path
-  "Build path to value in an event's payload."
-  [kw]
-  [:event/payload kw])
-
-(defn metadata-path
-  "Build path to value in an event's metadata."
-  [kw]
-  [:event/metadata kw])
-
 (defmacro defevent
+  "Define an event.
+
+  type and schema are required, and type should be unique across calls
+  to defevent. Schema must be a valid malli schema.
+
+  Creates an event constructor function that validates payloads
+  against the event's schema."
   {:clj-kondo/lint-as 'clojure.core/def}
   [name & {:keys [type version tags schema]}]
   (when-not type (throw (ex-info "Event definition must declare a type." {})))
@@ -47,7 +42,7 @@
   (let [v (or version 1)
         tags (or tags [])]
     `(do
-       (register-event-tags ~type ~tags)
+       (dk.planm.ledjer.event/register-event-tags ~type ~tags)
        (defn ~name
          ([] ~type)
          ([payload#] (~name {} payload#))
@@ -61,219 +56,26 @@
               (throw (ex-info "Event does not match schema."
                               (-> e# ex-data :data :explain malli.error/humanize))))))))))
 
-(defn get-event-tags
-  ([event-type]
-   (get-event-tags event-type @event-tag-registry))
-  ([event-type registry]
-   (get registry event-type)))
+(defn source
+  "Source the events matching event-types and tag-bindings from the
+  event-store.
 
-(defn event-type
-  [event]
-  (:event/type event))
+  Valid options:
 
-(defn- tag-path->string
-  [tag-path]
-  ;; (assert (= 2 (count tag-path)) "tag-path must be a pair")
-  (let [kw (last tag-path)]
-    (if-let [prefix (namespace kw)]
-      (str prefix "__" (name kw))
-      (name kw))))
+  - start-sequence: The sequence number from which to start sourcing"
+  [event-store event-types tag-bindings & opts]
+  (p/-source event-store event-types tag-bindings opts))
 
-(defn event-path-vec
-  [event-type tag-bindings]
-  (let [tags (get-event-tags event-type)
-        tags-with-data (mapcat
-                        (fn [tag]
-                          [(tag-path->string tag) (get tag-bindings tag "*")])
-                        tags)]
-    (into [(tag-path->string [event-type])] tags-with-data)))
-
-(defn event->tag-bindings
-  [event]
-  (let [tags (get-event-tags (event-type event))]
-    (reduce
-     (fn [acc tag]
-       (assoc acc tag (get-in event tag)))
-     {}
-     tags)))
-
-(defn event-append-path
-  "Compute the file system path for the event's stream."
-  [event]
-  (string/join "/" (event-path-vec (event-type event) (event->tag-bindings event))))
-
-(defn event-read-path
-  "Compute the file system path for reading the event stream of event-type. Can contain globs."
-  [event-type tag-bindings]
-  (string/join "/" (event-path-vec event-type tag-bindings)))
-
-(defn event-append-subject
-  "Compute the NATS subject for the event."
-  [event]
-  (string/join "." (event-path-vec (:event/type event) (event->tag-bindings event))))
-
-(defn event-read-subject
-  "Compute the NATS subject filter for the event type. Can contain wildcards."
-  [event-type tag-bindings]
-  (string/join "." (event-path-vec event-type tag-bindings)))
-
-(defprotocol EventStore
-  :extend-via-metadata true
-  (-source [this event-types tag-bindings opts])
-  (-subscribe [this event-types tag-bindings])
-  (-append [this event]))
-
-(defn source [event-store event-types tag-bindings & opts]
-  (-source event-store event-types tag-bindings opts))
-
-(defn subscribe [event-store event-types tag-bindings]
-  (-subscribe event-store event-types tag-bindings))
-
-(defn append [event-store event]
-  (-append event-store event))
-
-(defn- get-in*
-  "Like get-in but supports wildcards (\"*\")"
-  [m path]
-  (specter/select
-   (mapv (fn [path-item]
-           (if (= "*" path-item)
-             specter/MAP-VALS
-             path-item))
-         path)
-   m))
-
-(defn- in-memory-source
-  [event-store event-types tag-bindings opts]
-  (let [{:keys [start-sequence]} opts
-        all-events @(:events event-store)
-        event-paths (map
-                     (fn [event-type]
-                       (event-path-vec event-type tag-bindings))
-                     event-types)]
-    (let [events (->> event-paths
-                      (mapcat (fn [path] (get-in* all-events path)))
-                      (filter (comp not nil?))
-                      (flatten)
-                      (sort-by (fn [ev] (get-in ev [:event/metadata :sequence]))))]
-      (if start-sequence
-        (into [] (drop-while (fn [e] (< (:sequence (metadata e)) start-sequence))) events)
-        events))))
-
-(defn- in-memory-append
-  [event-store event]
-  (let [event-path (event-path-vec (:event/type event) (event->tag-bindings event))]
-    (dosync
-     (let [e (assoc-in event [:event/metadata :sequence] @(:event-counter event-store))]
-       (alter (:events event-store)
-              update-in
-              event-path
-              (fnil conj [])
-              e)
-       (alter (:event-counter event-store) inc)
-       e))))
-
-(defn has-bindings?
-  "Test if event has values matching the tag-bindings map, respecting wildcards."
-  [event tag-bindings]
-  (reduce
-   (fn [acc [k v]]
-     (cond
-       (= "*" v)
-       acc
-
-       (= ::not-found (get-in event k ::not-found))
-       acc
-
-       (= v (get-in event k))
-       true
-
-       :else
-       (reduced false)))
-   true
-   tag-bindings))
-
-(defn- sequence-num [event]
-  (get-in event [:event/metadata :sequence]))
-
-(defn- in-memory-subscribe
+(defn subscribe
+  "Subscribe to new events arriving in the event-store which match
+  event-types and tag-bindings."
   [event-store event-types tag-bindings]
-  (let [c (async/chan 10)]
-    (add-watch (:event-counter event-store)
-               :w
-               (fn [_key _ref current-sequence-num _next-sequence-num]
-                 (let [latest-event (specter/select-one
-                                     (specter/walker #(= (sequence-num %) current-sequence-num))
-                                     @(:events event-store))]
-                   (when (and (get event-types (:event/type latest-event))
-                              (has-bindings? latest-event tag-bindings))
-                     (println "found event")
-                     (when-not (async/put! c latest-event)
-                       (println "removing watch")
-                       (remove-watch (:event-counter event-store) :w))))))
-    c))
+  (p/-subscribe event-store event-types tag-bindings))
 
-(defn in-memory-event-store
-  []
-  (with-meta
-    {:events (ref {})
-     :event-counter (ref 0)}
-    {`-source #'in-memory-source
-     `-append #'in-memory-append
-     `-subscribe #'in-memory-subscribe}))
-
-(defn- binding-pair-type
-  "Get the event type from a state view binding pair."
-  [binding-pair]
-  (let [[kw-or-vec _] binding-pair]
-    (if (keyword? kw-or-vec)
-      kw-or-vec
-      (first kw-or-vec))))
-
-(defn- binding-pair-tags
-  "Get the tag bindings from a state view binding pair."
-  [binding-pair]
-  (let [[kw-or-vec _] binding-pair]
-    (if (keyword? kw-or-vec)
-      {}
-      (second kw-or-vec))))
-
-(defn- binding-pair-reducer
-  "Get the event reducer from a state view binding pair."
-  [binding-pair]
-  (let [[_ reducer] binding-pair]
-    reducer))
-
-(defn- binding-pair-reducer-for
-  "Get the event reducer for event from the state view binding-pairs."
-  [binding-pairs event]
-  (let [pairs-matching-type (into {}
-                                  (comp
-                                   (filter (fn [pair]
-                                             (= (binding-pair-type pair) (event-type event))))
-                                   (filter (fn [pair]
-                                             (has-bindings? event (binding-pair-tags pair)))))
-                                  binding-pairs)]
-    (if (not= 1 (count pairs-matching-type))
-      (throw (ex-info "Expected exactly one matching binding pair per event!" {:num-matching (count pairs-matching-type)}))
-      (binding-pair-reducer (first pairs-matching-type)))))
-
-(defn view*
-  "Given a map of binding-pairs, either kw -> reducer-fn or [kw
-  tag-bindings] -> reducer-fn, and a map of tag-bindings, reduces
-  events sourced from event-store to a single value using the
-  reducer-fns.
-
-  Will throw in case an event is sourced for which there is no
-  reducer-fn registered."
-  [event-store binding-pairs tag-bindings initial-acc]
-  (let [events (source event-store (into #{} (map binding-pair-type) binding-pairs) tag-bindings)]
-    (reduce
-     (fn [acc event]
-       (let [event-reducer (binding-pair-reducer-for binding-pairs event)]
-         (event-reducer acc event)))
-     initial-acc
-     events)))
+(defn append
+  "Append an event to the event-store."
+  [event-store event]
+  (p/-append event-store event))
 
 (defmacro defview
   "Define a state view, a function of an event-store and a map of tag
@@ -287,17 +89,7 @@
          ^{:state-view true}
          ~(vary-meta name merge {:state-view true})
          [event-store# tag-bindings#]
-         (view* event-store# ~binding-pairs-seq tag-bindings# ~initial-acc)))))
-
-(defn periodic
-  "Helper to create periodic ticks, useful as triggers for automations."
-  [ms]
-  (let [out-c (async/chan 1)]
-    (async/go-loop []
-      (let [_ (async/<! (async/timeout ms))]
-        (when (async/>! out-c :tick)
-          (recur))))
-    out-c))
+         (dk.planm.ledjer.view/view* event-store# ~binding-pairs-seq tag-bindings# ~initial-acc)))))
 
 (defn- channel?
   [v]
@@ -323,32 +115,43 @@
                                      trigger-event-tag-pairs))
                           (into trigger-channels)
                           (conj stop-chan))]
-    (println trigger-events)
-    (println trigger-event-tag-pairs)
-    (println trigger-channels)
-    (println trigger-chans)
     (async/go-loop [[_ p] (async/alts! trigger-chans)]
-      (println (str "automation: " p))
-      (tap> [:automation-triggered])
+      (tap> [:automation-triggered {:stop? (= p stop-chan)}])
       (when-not (= p stop-chan)
         (body-fn event-store)
         (recur (async/alts! trigger-chans))))
     (fn []
       (async/close! stop-chan))))
 
-(defn stop-automation
-  [automation]
-  (async/close! automation))
+(defn gwt
+  "Given-When-Then tests whether a state change or state view (when)
+  result in the expected output(s) (then) given the input
+  events (given).
 
-(defn gwt*
+  - given must be a vector of event types
+
+  - when must be a vector where the first element is a var that
+  contains the state view or state change function and the rest are
+  extra arguments to the function
+
+  - then can be an arbitrary value (if the var in when points to a
+  state view), a vector of events (if the var in when points to a
+  state change), or a regex (if the var points to a state change)
+
+  When then is a regex, it means an exception is expected to be thrown
+  with a message matching the regex.
+
+  When then is a vector of events, it is expected that their types and
+  payloads match those of the events resulting from the state change
+  exactly, including order."
   [& {:keys [given when then]}]
   (assert (var? (first when)) "The first element of the :when must be a var. Did you forget to prepend #' or wrap it in (var)?")
-  (let [event-store (in-memory-event-store)
+  (let [event-store (store.memory/in-memory-event-store)
         [when-fn & payload] when
         start-sequence (atom 0)]
     (doseq [g given]
       (let [e (append event-store g)]
-        (reset! start-sequence (:sequence (metadata e)))))
+        (reset! start-sequence (:sequence (event/metadata e)))))
     (if (instance? java.util.regex.Pattern then)
       (test/is (thrown-with-msg? clojure.lang.ExceptionInfo then (apply when-fn event-store payload)))
       (if (:state-view (meta when-fn))
@@ -360,8 +163,20 @@
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
 
 (defn gt
+  "Given-Then tests whether an automation results in the expected
+  outputs (then) given the input events.
+
+  - automation must be a function returning an automation given an
+  event-store
+
+  - given must be a vector of event types
+
+  - then must be a vector of events
+
+  - timeout-ms (optional) controls for how long the test will await
+  the automation before timing out"
   [& {:keys [automation given then timeout-ms]}]
-  (let [event-store (in-memory-event-store)
+  (let [event-store (store.memory/in-memory-event-store)
         automation-stop-fn (automation event-store)]
     (try
       (doseq [g given]
@@ -369,7 +184,7 @@
       (let [timeout-ch (async/timeout (or timeout-ms 1000))
             new-events-ch (async/take
                            (count then)
-                           (subscribe event-store (into #{} (map event-type then)) {}))
+                           (subscribe event-store (into #{} (map event/event-type then)) {}))
             go-ch (async/go-loop [[t & thens] then
                                   ev (async/<! new-events-ch)]
                     (when ev
@@ -387,17 +202,12 @@
 
 (comment
 
-  (a-event)
-  (a-event {:entity/id "foobar" :fo "one"})
-  (a-event {:correlation-id 123} {:entity/id "foobar" :foo "one"})
-  (event-append-path (a-event {} {:entity/id "foobar" :foo "one"}))
-  (event-read-path (a-event) {(payload-path :entity/id) "test" (payload-path :foo) "notme"})
-  (event-append-subject (a-event {} {:entity/id "foobar" :foo "one"}))
-  (event-read-subject (a-event) {(payload-path :foo) "yesman"})
   (defevent a-event
     :type :test/a
     :version 1
-    :tags [(metadata-path :version) (payload-path :entity/id) (payload-path :foo)]
+    :tags [(event/metadata-path :version)
+           (event/payload-path :entity/id)
+           (event/payload-path :foo)]
     :schema [:map
              [:entity/id :string]
              [:foo :string]])
@@ -405,7 +215,9 @@
   (defevent a-event-v2
     :type :test/a
     :version 2
-    :tags [(metadata-path :version) (payload-path :entity/id) (payload-path :foo)]
+    :tags [(event/metadata-path :version)
+           (event/payload-path :entity/id)
+           (event/payload-path :foo)]
     :schema [:map
              [:entity/id :string]
              [:new-key :int]
@@ -413,15 +225,22 @@
   (defevent b-event
     :type :test/b
     :version 1
-    :tags [(payload-path :entity/id)]
+    :tags [(event/payload-path :entity/id)]
     :schema [:map
              [:entity/id :string]
              [:bar :string]])
+
+  (a-event)
+  (a-event {:entity/id "foobar" :fo "one"})
+  (a-event {:correlation-id 123} {:entity/id "foobar" :foo "one"})
+
   #__)
 
 (comment
-  (def evs5 (in-memory-event-store))
-  (def sub-c (subscribe evs5 #{(a-event) (b-event)} {(payload-path :entity/id) "foobar" (payload-path :foo) "two" (payload-path :bar) "*"}))
+  (def evs5 (store.memory/in-memory-event-store))
+  (def sub-c (subscribe evs5 #{(a-event) (b-event)} {(event/payload-path :entity/id) "foobar"
+                                                     (event/payload-path :foo) "two"
+                                                     (event/payload-path :bar) "*"}))
 
   (def go-c (async/go-loop []
               (when-let [v (async/<! sub-c)]
@@ -436,17 +255,17 @@
   (append evs5 (a-event {:entity/id "snaz" :foo "two"}))
   (append evs5 (a-event-v2 {:entity/id "foobar" :foo "one" :new-key 42}))
 
-  (count (source evs5 #{(a-event)} {(payload-path :foo) "two"}))
+  (count (source evs5 #{(a-event)} {(event/payload-path :foo) "two"}))
   (count (source evs5 #{(a-event)} {}))
   )
 
 (comment
   (defview some-view {}
-    [(a-event) {(metadata-path :version) 1}]
+    [(a-event) {(event/metadata-path :version) 1}]
     (fn a-reducer [acc _e]
       (update acc :count-v1 (fnil inc 0)))
 
-    [(a-event) {(metadata-path :version) 2}]
+    [(a-event) {(event/metadata-path :version) 2}]
     (fn a-reducer [acc _e]
       (update acc :count-v2 (fnil inc 0)))
 
@@ -468,7 +287,7 @@
                   (let [counts (some-view event-store {})]
                     (test-change event-store counts)))))
 
-  (stop-automation some-auto)
+  (some-auto)
   )
 
 (comment
@@ -480,14 +299,14 @@
         #_(throw (ex-info "Foobar" {}))
         (append event-store (b-event {:entity/id (:entity/id payload) :bar the-bar})))))
 
-  (gwt*
+  (gwt
    :given [(a-event {:entity/id "1" :foo "one"})
            (a-event {:entity/id "1" :foo "two"})]
    :when [test-change {:op "combine" :entity/id "1"}]
    :then #_#"Foobar"[(b-event {:entity/id "1" :bar "onetwo"})])
 
 
-  (gwt*
+  (gwt
    :given [(a-event {:entity/id "1" :foo "one"})]
    :when [some-view {}]
    :then {:count 1}))
