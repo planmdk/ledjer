@@ -30,9 +30,9 @@
   [binding-pairs event]
   (let [pairs-matching-type (into {}
                                   (comp
-                                   (filter (fn [pair]
+                                   (filter (fn type-filter [pair]
                                              (= (binding-pair-type pair) (event/event-type event))))
-                                   (filter (fn [pair]
+                                   (filter (fn binding-filter [pair]
                                              (event/has-bindings? event (binding-pair-tags pair)))))
                                   binding-pairs)]
     (if (not= 1 (count pairs-matching-type))
@@ -48,7 +48,10 @@
   Will throw in case an event is sourced for which there is no
   reducer-fn registered."
   [event-store binding-pairs tag-bindings initial-acc]
-  (let [events (p/-source event-store (into #{} (map binding-pair-type) binding-pairs) tag-bindings {})]
+  (let [events (p/-source event-store
+                          #{{:event-types (into #{} (map binding-pair-type) binding-pairs)
+                             :tag-bindings tag-bindings}}
+                          {})]
     (reduce
      (fn [acc event]
        (let [event-reducer (binding-pair-reducer-for binding-pairs event)]

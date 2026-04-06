@@ -62,20 +62,40 @@
 
   Valid options:
 
-  - start-sequence: The sequence number from which to start sourcing"
-  [event-store event-types tag-bindings & opts]
-  (p/-source event-store event-types tag-bindings opts))
+  - start-sequence: The sequence number from which to start sourcing
+
+  query is a set of maps with keys :event-types #{} and :tag-bindings
+  {}. A query map describes the event types and tag bindings that must
+  all match; and multiple query maps are joined by logical OR."
+  [event-store query & opts]
+  (p/-source event-store query opts))
 
 (defn subscribe
   "Subscribe to new events arriving in the event-store which match
-  event-types and tag-bindings."
-  [event-store event-types tag-bindings]
-  (p/-subscribe event-store event-types tag-bindings))
+  event-types and tag-bindings.
+
+  query is a set of maps with keys :event-types #{} and :tag-bindings
+  {}. A query map describes the event types and tag bindings that must
+  all match; and multiple query maps are joined by logical OR."
+  [event-store query]
+  (p/-subscribe event-store query))
 
 (defn append
-  "Append an event to the event-store."
-  [event-store event]
-  (p/-append event-store event))
+  "Append an event to the event-store.
+
+  The optional condition is a map with the keys:
+
+  - query: a set of query maps as for source and subscribe
+
+  - after: the sequence number at which to start looking for new
+  events matching query
+
+  Evaluates condition immediately before persisting events. Appending
+  events will fail if any events are returned by the condition query."
+  ([event-store events]
+   (append event-store events nil))
+  ([event-store events condition]
+   (p/-append event-store events condition)))
 
 (defmacro defview
   "Define a state view, a function of an event-store and a map of tag
@@ -109,9 +129,9 @@
         trigger-channels (filter channel? triggers)
         stop-chan (async/chan 1)
         trigger-chans (-> #{}
-                          (conj (subscribe event-store trigger-events {}))
+                          (conj (subscribe event-store #{{:event-types trigger-events}}))
                           (into (map (fn [[event-type tag-bindings]]
-                                       (subscribe event-store event-type tag-bindings))
+                                       (subscribe event-store #{{:event-types #{event-type} :tags-bindings tag-bindings}}))
                                      trigger-event-tag-pairs))
                           (into trigger-channels)
                           (conj stop-chan))]
@@ -184,7 +204,7 @@
       (let [timeout-ch (async/timeout (or timeout-ms 1000))
             new-events-ch (async/take
                            (count then)
-                           (subscribe event-store (into #{} (map event/event-type then)) {}))
+                           (subscribe event-store #{{:event-types (into #{} (map event/event-type then))}}))
             go-ch (async/go-loop [[t & thens] then
                                   ev (async/<! new-events-ch)]
                     (when ev

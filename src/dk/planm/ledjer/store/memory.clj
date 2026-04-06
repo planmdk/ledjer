@@ -1,7 +1,7 @@
 (ns dk.planm.ledjer.store.memory
   (:require
    [clojure.core.async :as async]
-   [clojure.string :as string]
+   [clojure.set :as set]
    [com.rpl.specter :as specter]
    [dk.planm.ledjer.event :as event]
    [dk.planm.ledjer.protocols :as p]))
@@ -13,7 +13,7 @@
       (str prefix "__" (name kw))
       (name kw))))
 
-(defn event-path-vec
+(defn- event-path-vec
   [event-type tag-bindings]
   (let [tags (event/get-event-tags event-type)
         tags-with-data (mapcat
@@ -21,16 +21,6 @@
                           [(tag-path->string tag) (get tag-bindings tag "*")])
                         tags)]
     (into [(tag-path->string [event-type])] tags-with-data)))
-
-(defn event-append-path
-  "Compute the file system path for the event's stream."
-  [event]
-  (string/join "/" (event-path-vec (event/event-type event) (event/event->tag-bindings event))))
-
-(defn event-read-path
-  "Compute the file system path for reading the event stream of event-type. Can contain globs."
-  [event-type tag-bindings]
-  (string/join "/" (event-path-vec event-type tag-bindings)))
 
 (defn- get-in*
   "Like get-in but supports wildcards (\"*\")"
@@ -43,41 +33,56 @@
          path)
    m))
 
-(defn- in-memory-source
-  [event-store event-types tag-bindings opts]
+(defn- sequence-num [event]
+  (get-in event [:event/metadata :sequence]))
+
+(defn- source-single-query
+  [event-store query-map opts]
   (let [{:keys [start-sequence]} opts
+        {:keys [event-types tag-bindings]} query-map
         all-events @(:events event-store)
         event-paths (map
                      (fn [event-type]
                        (event-path-vec event-type tag-bindings))
                      event-types)
         events (->> event-paths
-                      (mapcat (fn [path] (get-in* all-events path)))
-                      (filter (comp not nil?))
-                      (flatten)
-                      (sort-by (fn [ev] (get-in ev [:event/metadata :sequence]))))]
+                    (mapcat (fn [path] (get-in* all-events path)))
+                    (filter (comp not nil?))
+                    (flatten))]
     (if start-sequence
-      (into [] (drop-while (fn [e] (< (:sequence (event/metadata e)) start-sequence))) events)
-      events)))
+      (into #{} (drop-while (fn [e] (< (sequence-num e) start-sequence))) events)
+      (into #{} events))))
+
+(defn- in-memory-source
+  [event-store query opts]
+  (into []
+        (sort-by sequence-num
+                 (reduce (fn [acc query-map]
+                           (into acc (source-single-query event-store query-map opts)))
+                         #{}
+                         query))))
 
 (defn- in-memory-append
-  [event-store event]
-  (let [event-path (event-path-vec (:event/type event) (event/event->tag-bindings event))]
-    (dosync
-     (let [e (assoc-in event [:event/metadata :sequence] @(:event-counter event-store))]
-       (alter (:events event-store)
-              update-in
-              event-path
-              (fnil conj [])
-              e)
-       (alter (:event-counter event-store) inc)
-       e))))
-
-(defn- sequence-num [event]
-  (get-in event [:event/metadata :sequence]))
+  [event-store events condition]
+  (dosync
+   (let [appended-events (doall
+                          (for [event events]
+                            (let [e (assoc-in event [:event/metadata :sequence] (System/currentTimeMillis))
+                                  event-path (event-path-vec (:event/type event) (event/event->tag-bindings event))]
+                              (alter (:events event-store)
+                                     update-in
+                                     event-path
+                                     (fnil conj [])
+                                     e)
+                              e)))]
+     (when (seq condition)
+       (let [{:keys [query after]} condition
+             events (p/-source event-store query (when after {:start-sequence after}))]
+         (when (seq (set/difference (into #{} events) (into #{} appended-events)))
+           (throw (ex-info "tx failed" {}))))))))
 
 (defn- in-memory-subscribe
-  [event-store event-types tag-bindings]
+  [event-store query]
   (let [c (async/chan 10)]
     (add-watch (:event-counter event-store)
                :w
@@ -85,19 +90,19 @@
                  (let [latest-event (specter/select-one
                                      (specter/walker #(= (sequence-num %) current-sequence-num))
                                      @(:events event-store))]
-                   (when (and (get event-types (:event/type latest-event))
-                              (event/has-bindings? latest-event tag-bindings))
-                     (println "found event")
-                     (when-not (async/put! c latest-event)
-                       (println "removing watch")
-                       (remove-watch (:event-counter event-store) :w))))))
+                   (doseq [{:keys [event-types tag-bindings]} query]
+                     (when (and (get event-types (event/event-type latest-event))
+                                (event/has-bindings? latest-event tag-bindings))
+                       (println "found event")
+                       (when-not (async/put! c latest-event)
+                         (println "removing watch")
+                         (remove-watch (:event-counter event-store) :w)))))))
     c))
 
 (defn in-memory-event-store
   []
   (with-meta
-    {:events (ref {})
-     :event-counter (ref 0)}
+    {:events (ref {})}
     {`p/-source #'in-memory-source
      `p/-append #'in-memory-append
      `p/-subscribe #'in-memory-subscribe}))

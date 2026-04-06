@@ -43,7 +43,7 @@
 
 (defn event->tag-bindings
   [event]
-  (let [tags (event/get-event-tags (event/event-type event))]
+  (let [tags (get-event-tags (event-type event))]
     (reduce
      (fn [acc tag]
        (assoc acc tag (get-in event tag)))

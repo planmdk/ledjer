@@ -2,6 +2,6 @@
 
 (defprotocol EventStore
   :extend-via-metadata true
-  (-source [this event-types tag-bindings opts])
-  (-subscribe [this event-types tag-bindings])
-  (-append [this event]))
+  (-source [this query opts])
+  (-subscribe [this query])
+  (-append [this events condition]))
