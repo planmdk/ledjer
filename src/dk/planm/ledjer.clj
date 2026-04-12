@@ -22,6 +22,7 @@
    [dk.planm.ledjer.event :as event]
    [dk.planm.ledjer.protocols :as p]
    [dk.planm.ledjer.store.memory :as store.memory]
+   [dk.planm.ledjer.view]
    [malli.core :as malli]
    [malli.error :as merror])
   (:import
