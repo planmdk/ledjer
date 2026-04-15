@@ -82,7 +82,7 @@
   (p/-subscribe event-store query))
 
 (defn append
-  "Append an event to the event-store.
+  "Append events to the event-store.
 
   The optional condition is a map with the keys:
 
@@ -92,7 +92,9 @@
   events matching query
 
   Evaluates condition immediately before persisting events. Appending
-  events will fail if any events are returned by the condition query."
+  events will fail if any events are returned by the condition query.
+
+  Returns the appended events."
   ([event-store events]
    (append event-store events nil))
   ([event-store events condition]
@@ -170,9 +172,8 @@
   (let [event-store (store.memory/in-memory-event-store)
         [when-fn & payload] when
         start-sequence (atom 0)]
-    (doseq [g given]
-      (let [e (append event-store g)]
-        (reset! start-sequence (:sequence (event/metadata e)))))
+    (let [appended-events (append event-store given)]
+      (reset! start-sequence (:sequence (event/metadata (last appended-events)))))
     (if (instance? java.util.regex.Pattern then)
       (test/is (thrown-with-msg? clojure.lang.ExceptionInfo then (apply when-fn event-store payload)))
       (if (:state-view (meta when-fn))
@@ -190,7 +191,7 @@
   - automation must be a function returning an automation given an
   event-store
 
-  - given must be a vector of event types
+  - given must be a vector of events
 
   - then must be a vector of events
 
@@ -200,8 +201,7 @@
   (let [event-store (store.memory/in-memory-event-store)
         automation-stop-fn (automation event-store)]
     (try
-      (doseq [g given]
-        (append event-store g))
+      (append event-store given)
       (let [timeout-ch (async/timeout (or timeout-ms 1000))
             new-events-ch (async/take
                            (count then)

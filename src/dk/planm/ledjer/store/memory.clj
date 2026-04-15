@@ -81,7 +81,8 @@
        (let [{:keys [query after]} condition
              events (p/-source event-store query (when after {:start-sequence after}))]
          (when (seq (set/difference (into #{} events) (into #{} appended-events)))
-           (throw (ex-info "tx failed" {}))))))))
+           (throw (ex-info "tx failed" {})))))
+     appended-events)))
 
 (defn- in-memory-subscribe
   [event-store query]
