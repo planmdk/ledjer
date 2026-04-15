@@ -67,8 +67,10 @@
   (dosync
    (let [appended-events (doall
                           (for [event events]
-                            (let [e (assoc-in event [:event/metadata :sequence] (System/currentTimeMillis))
+                            (let [now-ms (System/currentTimeMillis)
+                                  e (assoc-in event [:event/metadata :sequence] now-ms)
                                   event-path (event-path-vec (:event/type event) (event/event->tag-bindings event))]
+                              (ref-set (:last-sequence-number event-store) now-ms)
                               (alter (:events event-store)
                                      update-in
                                      event-path
@@ -84,9 +86,9 @@
 (defn- in-memory-subscribe
   [event-store query]
   (let [c (async/chan 10)]
-    (add-watch (:event-counter event-store)
+    (add-watch (:last-sequence-number event-store)
                :w
-               (fn [_key _ref current-sequence-num _next-sequence-num]
+               (fn [_key _ref _previous-sequence-num current-sequence-num]
                  (let [latest-event (specter/select-one
                                      (specter/walker #(= (sequence-num %) current-sequence-num))
                                      @(:events event-store))]
@@ -102,7 +104,8 @@
 (defn in-memory-event-store
   []
   (with-meta
-    {:events (ref {})}
+    {:events (ref {})
+     :last-sequence-number (ref 0)}
     {`p/-source #'in-memory-source
      `p/-append #'in-memory-append
      `p/-subscribe #'in-memory-subscribe}))
