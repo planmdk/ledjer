@@ -183,7 +183,7 @@
         (do
           (apply when-fn event-store payload)
           (let [new-events (source event-store
-                                   (into #{} {:event-types (map :event/type then)})
+                                   #{{:event-types (into #{} (map :event/type then))}}
                                    {:start-sequence @start-sequence})]
             (test/is (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
