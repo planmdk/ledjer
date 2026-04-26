@@ -68,8 +68,10 @@
   query is a set of maps with keys :event-types #{} and :tag-bindings
   {}. A query map describes the event types and tag bindings that must
   all match; and multiple query maps are joined by logical OR."
-  [event-store query & opts]
-  (p/-source event-store query opts))
+  ([event-store query]
+   (source event-store query {}))
+  ([event-store query opts]
+   (p/-source event-store query opts)))
 
 (defn subscribe
   "Subscribe to new events arriving in the event-store which match
@@ -180,7 +182,9 @@
         (test/is (= (apply when-fn event-store payload) then))
         (do
           (apply when-fn event-store payload)
-          (let [new-events (source event-store (into #{} (map :event/type then)) {} :start-sequence @start-sequence)]
+          (let [new-events (source event-store
+                                   (into #{} {:event-types (map :event/type then)})
+                                   {:start-sequence @start-sequence})]
             (test/is (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
 
@@ -270,14 +274,13 @@
   (async/close! go-c)
   (async/close! sub-c)
 
-  (append evs5 (a-event {:entity/id "foobar" :foo "one"}))
-  (append evs5 (a-event {:entity/id "foobar" :foo "two"}))
+  (append evs5 [(a-event {:entity/id "foobar" :foo "one"})])
+  (append evs5 [(a-event {:entity/id "foobar" :foo "two"})])
   (append evs5 (b-event {:entity/id "foobar" :bar "snaz"}))
   (append evs5 (a-event {:entity/id "snaz" :foo "two"}))
   (append evs5 (a-event-v2 {:entity/id "foobar" :foo "one" :new-key 42}))
 
-  (count (source evs5 #{(a-event)} {(event/payload-path :foo) "two"}))
-  (count (source evs5 #{(a-event)} {}))
+  (count (source evs5 #{{:event-types #{(a-event)} :tag-bindings {(event/payload-path :foo) "two"}}}))
   )
 
 (comment
