@@ -67,10 +67,9 @@
   (dosync
    (let [appended-events (doall
                           (for [event events]
-                            (let [now-ms (System/currentTimeMillis)
-                                  e (assoc-in event [:event/metadata :sequence] now-ms)
+                            (let [next-seq-num (alter (:last-sequence-number event-store) inc)
+                                  e (assoc-in event [:event/metadata :sequence] next-seq-num)
                                   event-path (event-path-vec (:event/type event) (event/event->tag-bindings event))]
-                              (ref-set (:last-sequence-number event-store) now-ms)
                               (alter (:events event-store)
                                      update-in
                                      event-path
