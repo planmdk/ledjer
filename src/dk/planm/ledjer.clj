@@ -67,7 +67,9 @@
 
   query is a set of maps with keys :event-types #{} and :tag-bindings
   {}. A query map describes the event types and tag bindings that must
-  all match; and multiple query maps are joined by logical OR."
+  all match; and multiple query maps are joined by logical OR.
+
+  Returns a vector of the events."
   ([event-store query]
    (source event-store query {}))
   ([event-store query opts]
@@ -79,7 +81,9 @@
 
   query is a set of maps with keys :event-types #{} and :tag-bindings
   {}. A query map describes the event types and tag bindings that must
-  all match; and multiple query maps are joined by logical OR."
+  all match; and multiple query maps are joined by logical OR.
+
+  Returns a core.async channel which receives events as they arrive."
   [event-store query]
   (p/-subscribe event-store query))
 
@@ -96,7 +100,7 @@
   Evaluates condition immediately before persisting events. Appending
   events will fail if any events are returned by the condition query.
 
-  Returns the appended events."
+  Returns the position of the last appended event."
   ([event-store events]
    (append event-store events nil))
   ([event-store events condition]
