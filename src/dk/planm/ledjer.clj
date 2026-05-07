@@ -178,8 +178,8 @@
   (let [event-store (store.memory/in-memory-event-store)
         [when-fn & payload] when
         start-sequence (atom 0)]
-    (let [appended-events (append event-store given)]
-      (reset! start-sequence (:sequence (event/metadata (last appended-events)))))
+    (let [current-position (append event-store given)]
+      (reset! start-sequence (inc current-position)))
     (if (instance? java.util.regex.Pattern then)
       (test/is (thrown-with-msg? clojure.lang.ExceptionInfo then (apply when-fn event-store payload)))
       (if (:state-view (meta when-fn))
