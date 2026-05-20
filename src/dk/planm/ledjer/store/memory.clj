@@ -48,7 +48,8 @@
         events (->> event-paths
                     (mapcat (fn [path] (get-in* all-events path)))
                     (filter (comp not nil?))
-                    (flatten))]
+                    (flatten)
+                    (sort-by #(sequence-num %)))]
     (if start-sequence
       (into #{} (drop-while (fn [e] (< (sequence-num e) start-sequence))) events)
       (into #{} events))))
