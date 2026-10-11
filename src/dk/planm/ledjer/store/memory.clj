@@ -86,22 +86,48 @@
            (throw (ex-info "tx failed" {})))))
      (:sequence (event/metadata (last appended-events))))))
 
+(defn- matches?
+  "Whether event matches query-map, the same way source selects events:
+  its type is one of the query map's event types, and each of its
+  type's tags that is bound has the bound value, or is bound to \"*\".
+  Bindings for tags the event type doesn't have don't apply to it."
+  [event {:keys [event-types tag-bindings]}]
+  (let [event-type (event/event-type event)]
+    (and (contains? event-types event-type)
+         (every? (fn [tag]
+                   (let [bound (get tag-bindings tag "*")]
+                     (or (= "*" bound)
+                         (= bound (get-in event tag)))))
+                 (event/get-event-tags event-type)))))
+
+(defn- events-after
+  "The events with a sequence number in (from, to], in order."
+  [event-store from to]
+  (->> @(:events event-store)
+       (specter/select (specter/walker (fn [x]
+                                         (when-let [n (and (map? x) (sequence-num x))]
+                                           (< from n (inc to))))))
+       (sort-by sequence-num)))
+
 (defn- in-memory-subscribe
   [event-store query]
-  (let [c (async/chan 10)]
+  (let [c (async/chan 10)
+        ;; Each subscription needs its own watch key, or they would
+        ;; replace each other
+        watch-key (Object.)]
+    ;; A ref's watches are called once per transaction, so one append
+    ;; of several events moves the sequence number from previous to
+    ;; current in one step: deliver every event in between.
     (add-watch (:last-sequence-number event-store)
-               :w
-               (fn [_key _ref _previous-sequence-num current-sequence-num]
-                 (let [latest-event (specter/select-one
-                                     (specter/walker #(= (sequence-num %) current-sequence-num))
-                                     @(:events event-store))]
-                   (doseq [{:keys [event-types tag-bindings]} query]
-                     (when (and (get event-types (event/event-type latest-event))
-                                (event/has-bindings? latest-event tag-bindings))
-                       (println "found event")
-                       (when-not (async/put! c latest-event)
-                         (println "removing watch")
-                         (remove-watch (:event-counter event-store) :w)))))))
+               watch-key
+               (fn [key sequence-ref previous-sequence-num current-sequence-num]
+                 (loop [[event & events] (events-after event-store previous-sequence-num current-sequence-num)]
+                   (when event
+                     (if (and (some #(matches? event %) query)
+                              (not (async/put! c event)))
+                       ;; The channel is closed: end the subscription
+                       (remove-watch sequence-ref key)
+                       (recur events))))))
     c))
 
 (defn in-memory-event-store
