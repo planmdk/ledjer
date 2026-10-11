@@ -29,7 +29,9 @@
    (mapv (fn [path-item]
            (if (= "*" path-item)
              specter/MAP-VALS
-             path-item))
+             ;; Tag values can be of any type (e.g. UUIDs), and only
+             ;; some types are implicit specter navigators.
+             (specter/keypath path-item)))
          path)
    m))
 
