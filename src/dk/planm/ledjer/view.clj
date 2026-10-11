@@ -1,7 +1,8 @@
 (ns dk.planm.ledjer.view
   (:require
    [dk.planm.ledjer.event :as event]
-   [dk.planm.ledjer.protocols :as p]))
+   [dk.planm.ledjer.protocols :as p]
+   [dk.planm.ledjer.query :as query]))
 
 (defn- binding-pair-type
   "Get the event type from a state view binding pair."
@@ -49,8 +50,9 @@
   reducer-fn registered."
   [event-store binding-pairs tag-bindings initial-acc]
   (let [events (p/-source event-store
-                          #{{:event-types (into #{} (map binding-pair-type) binding-pairs)
-                             :tag-bindings tag-bindings}}
+                          (query/validate!
+                           #{{:event-types (into #{} (map binding-pair-type) binding-pairs)
+                              :tag-bindings tag-bindings}})
                           {})]
     (reduce
      (fn [acc event]

@@ -27,4 +27,12 @@
       (is (= [1 2]
              (map (comp :num e/payload)
                   (l/source event-store #{{:event-types #{(uuid-tagged-event)}
-                                           :tag-bindings {}}})))))))
+                                           :tag-bindings {}}})))))
+    (testing "\"*\" matches any value"
+      (is (= [1 2]
+             (map (comp :num e/payload)
+                  (l/source event-store #{{:event-types #{(uuid-tagged-event)}
+                                           :tag-bindings {(e/payload-path :id) "*"}}})))))
+    (testing "values match on type as well as value"
+      (is (empty? (l/source event-store #{{:event-types #{(uuid-tagged-event)}
+                                           :tag-bindings {(e/payload-path :id) (str id-1)}}}))))))

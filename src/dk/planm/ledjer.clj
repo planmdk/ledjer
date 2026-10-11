@@ -21,6 +21,7 @@
    [clojure.test :as test]
    [dk.planm.ledjer.event :as event]
    [dk.planm.ledjer.protocols :as p]
+   [dk.planm.ledjer.query :as query]
    [dk.planm.ledjer.store.memory :as store.memory]
    [dk.planm.ledjer.view]
    [malli.core :as malli]
@@ -67,13 +68,14 @@
 
   query is a set of maps with keys :event-types #{} and :tag-bindings
   {}. A query map describes the event types and tag bindings that must
-  all match; and multiple query maps are joined by logical OR.
+  all match; and multiple query maps are joined by logical OR. See
+  dk.planm.ledjer.query for details; invalid queries throw.
 
   Returns a vector of the events."
   ([event-store query]
    (source event-store query {}))
   ([event-store query opts]
-   (p/-source event-store query opts)))
+   (p/-source event-store (query/validate! query) opts)))
 
 (defn subscribe
   "Subscribe to new events arriving in the event-store which match
@@ -81,11 +83,12 @@
 
   query is a set of maps with keys :event-types #{} and :tag-bindings
   {}. A query map describes the event types and tag bindings that must
-  all match; and multiple query maps are joined by logical OR.
+  all match; and multiple query maps are joined by logical OR. See
+  dk.planm.ledjer.query for details; invalid queries throw.
 
   Returns a core.async channel which receives events as they arrive."
   [event-store query]
-  (p/-subscribe event-store query))
+  (p/-subscribe event-store (query/validate! query)))
 
 (defn append
   "Append events to the event-store.
@@ -104,6 +107,7 @@
   ([event-store events]
    (append event-store events nil))
   ([event-store events condition]
+   (some-> condition :query query/validate!)
    (p/-append event-store events condition)))
 
 (defmacro defview
@@ -140,7 +144,7 @@
         trigger-chans (-> #{}
                           (conj (subscribe event-store #{{:event-types trigger-events}}))
                           (into (map (fn [[event-type tag-bindings]]
-                                       (subscribe event-store #{{:event-types #{event-type} :tags-bindings tag-bindings}}))
+                                       (subscribe event-store #{{:event-types #{event-type} :tag-bindings tag-bindings}}))
                                      trigger-event-tag-pairs))
                           (into trigger-channels)
                           (conj stop-chan))]
