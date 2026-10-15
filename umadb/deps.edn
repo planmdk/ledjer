@@ -1,0 +1,9 @@
+{:paths ["src"]
+ :deps {io.github.planmdk/ledjer {:local/root "../core"}
+        com.github.igrishaev/deed-core {:mvn/version "0.1.0"}
+        io.github.domenicdev/umadb-java-client {:mvn/version "0.7"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts ["-m" "cognitect.test-runner"]
+         :exec-fn cognitect.test-runner.api/test}}}
