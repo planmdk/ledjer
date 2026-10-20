@@ -86,9 +86,19 @@
   all match; and multiple query maps are joined by logical OR. See
   dk.planm.ledjer.query for details; invalid queries throw.
 
+  Available options are:
+
+  - :start-sequence - a number
+
+  :start-sequence defines where in the event stream the subscription starts.
+  If unset, subscribe defaults to starting with the next event to arrive.
+
   Returns a core.async channel which receives events as they arrive."
-  [event-store query]
-  (p/-subscribe event-store (query/validate! query)))
+  ([event-store query]
+   (subscribe event-store query nil))
+
+  ([event-store query opts]
+   (p/-subscribe event-store (query/validate! query) opts)))
 
 (defn append
   "Append events to the event-store.
@@ -141,11 +151,12 @@
         trigger-event-tag-pairs (filter vector? triggers)
         trigger-channels (filter channel? triggers)
         stop-chan (async/chan 1)
-        trigger-chans (-> #{}
-                          (conj (subscribe event-store #{{:event-types trigger-events}}))
-                          (into (map (fn [[event-type tag-bindings]]
-                                       (subscribe event-store #{{:event-types #{event-type} :tag-bindings tag-bindings}}))
-                                     trigger-event-tag-pairs))
+        subscription-chans (-> #{}
+                               (conj (subscribe event-store #{{:event-types trigger-events}}))
+                               (into (map (fn [[event-type tag-bindings]]
+                                            (subscribe event-store #{{:event-types #{event-type} :tag-bindings tag-bindings}}))
+                                          trigger-event-tag-pairs)))
+        trigger-chans (-> subscription-chans
                           (into trigger-channels)
                           (conj stop-chan))]
     (async/go-loop [[_ p] (async/alts! trigger-chans)]
@@ -154,7 +165,9 @@
         (body-fn event-store)
         (recur (async/alts! trigger-chans))))
     (fn []
-      (async/close! stop-chan))))
+      (async/close! stop-chan)
+      (doseq [c subscription-chans]
+        (async/close! c)))))
 
 (defn gwt
   "Given-When-Then tests whether a state change or state view (when)
