@@ -102,6 +102,83 @@
           (Thread/sleep (long backoff))
           (recur (inc attempt) (* 2 backoff)))))))
 
+(defn- subscribe-persisted-view
+  "Subscribe to the events that binding-pairs apply to, starting at
+  start-sequence. Returns the subscription channel. Failures are
+  rethrown as ex-info with `:phase :subscribe`."
+  [event-store binding-pairs start-sequence]
+  (let [sub-query (query/validate!
+                   (into #{}
+                         (map (fn [binding-pair]
+                                {:event-types #{(binding-pair-type binding-pair)}
+                                 :tag-bindings (binding-pair-tags binding-pair)}))
+                         binding-pairs))]
+    (try
+      (p/-subscribe event-store sub-query {:start-sequence start-sequence})
+      (catch Throwable t
+        (throw (ex-info "Persisted view subscription failed"
+                        {:phase :subscribe
+                         :start-sequence start-sequence}
+                        t))))))
+
+(defn- run-persisted-view!
+  "On a new thread, apply the events arriving on sub-chan to acc and
+  commit them in batches, until stop-chan is closed or a failure
+  occurs. Takes ownership of sub-chan, closing it when done.
+
+  Returns a channel that closes when the thread is done. On failure,
+  it first resets failure to the exception and calls on-error, and
+  the channel yields the exception."
+  [acc
+   binding-pairs
+   sub-chan
+   stop-chan
+   failure
+   {:keys [max-size max-ms commit-retries commit-backoff-ms on-error]
+    :or {max-size 64
+         max-ms 200
+         commit-retries 3
+         commit-backoff-ms 100
+         on-error (fn rethrow [t] (throw t))}}]
+  (let [never-chan (async/chan 1)]
+    (async/thread
+      (try
+        (loop [n 0
+               last-seq nil
+               deadline nil]
+          (let [timeout-chan (if deadline
+                               (async/timeout (max 0 (- deadline (System/currentTimeMillis))))
+                               never-chan)
+                [event p] (async/alts!! [stop-chan timeout-chan sub-chan]
+                                        :priority true)]
+            (tap> [:persisted-view-sub-triggered {:stop? (= p stop-chan)}])
+            (cond
+              ;; Stopping flushes what has been applied
+              (= p stop-chan) (when last-seq
+                                (commit! acc last-seq commit-retries commit-backoff-ms))
+              (= p timeout-chan) (do
+                                   (commit! acc last-seq commit-retries commit-backoff-ms)
+                                   (recur 0 nil nil))
+              (nil? event) (throw (ex-info "Persisted view subscription closed unexpectedly"
+                                           {:phase :subscribe
+                                            :uncommitted-sequence last-seq}))
+              :else (do
+                      ;; reducer-fn is side-effecting on the acc
+                      (apply-event! acc binding-pairs event)
+                      (let [new-n (inc n)
+                            seq-num (get (event/metadata event) :sequence)]
+                        (if (>= new-n max-size)
+                          (do
+                            (commit! acc seq-num commit-retries commit-backoff-ms)
+                            (recur 0 nil nil))
+                          (recur new-n seq-num (or deadline (+ (System/currentTimeMillis) max-ms)))))))))
+        (catch Throwable t
+          (reset! failure t)
+          (on-error t)
+          t)
+        (finally
+          (async/close! sub-chan))))))
+
 (defn persisted-view*
   "Keeps `acc` up to date with the events matching `binding-pairs`
   using a subscription on `event-store`, committing to `acc` every
@@ -131,70 +208,16 @@
   Once failed, deref rethrows the failure. Recover by closing the
   view and starting a new one: it resumes after the accumulator's last
   committed sequence number."
-  [event-store binding-pairs acc & {:keys [max-size max-ms commit-retries commit-backoff-ms on-error]
-                                    :or {max-size 64
-                                         max-ms 200
-                                         commit-retries 3
-                                         commit-backoff-ms 100
-                                         on-error (fn rethrow [t] (throw t))}}]
+  [event-store binding-pairs acc & opts]
   (when-not (p/persisted-accumulator? acc)
     (throw (ex-info "acc must be a PersistedAccumulator" {})))
-  (let [starting-acc-sequence-num (if-let [last-sequence-number (p/-sequence-number acc)]
-                                    (inc last-sequence-number)
-                                    0)
-        never-chan (async/chan 1)
+  (let [start-sequence (if-let [last-sequence-number (p/-sequence-number acc)]
+                         (inc last-sequence-number)
+                         0)
+        sub-chan (subscribe-persisted-view event-store binding-pairs start-sequence)
         stop-chan (async/chan 1)
-        sub-query (query/validate!
-                   (into #{}
-                         (map (fn [binding-pair]
-                                {:event-types #{(binding-pair-type binding-pair)}
-                                 :tag-bindings (binding-pair-tags binding-pair)}))
-                         binding-pairs))
-        sub-chan (try
-                   (p/-subscribe event-store sub-query {:start-sequence starting-acc-sequence-num})
-                   (catch Throwable t
-                     (throw (ex-info "Persisted view subscription failed"
-                                     {:phase :subscribe
-                                      :start-sequence starting-acc-sequence-num}
-                                     t))))
         failure (atom nil)
-        worker (async/thread
-                 (try
-                   (loop [n 0
-                          last-seq nil
-                          deadline nil]
-                     (let [timeout-chan (if deadline
-                                          (async/timeout (max 0 (- deadline (System/currentTimeMillis))))
-                                          never-chan)
-                           [event p] (async/alts!! [stop-chan timeout-chan sub-chan]
-                                                   :priority true)]
-                       (tap> [:persisted-view-sub-triggered {:stop? (= p stop-chan)}])
-                       (cond
-                         ;; Stopping flushes what has been applied
-                         (= p stop-chan) (when last-seq
-                                           (commit! acc last-seq commit-retries commit-backoff-ms))
-                         (= p timeout-chan) (do
-                                              (commit! acc last-seq commit-retries commit-backoff-ms)
-                                              (recur 0 nil nil))
-                         (nil? event) (throw (ex-info "Persisted view subscription closed unexpectedly"
-                                                      {:phase :subscribe
-                                                       :uncommitted-sequence last-seq}))
-                         :else (do
-                                 ;; reducer-fn is side-effecting on the acc
-                                 (apply-event! acc binding-pairs event)
-                                 (let [new-n (inc n)
-                                       seq-num (get (event/metadata event) :sequence)]
-                                   (if (>= new-n max-size)
-                                     (do
-                                       (commit! acc seq-num commit-retries commit-backoff-ms)
-                                       (recur 0 nil nil))
-                                     (recur new-n seq-num (or deadline (+ (System/currentTimeMillis) max-ms)))))))))
-                   (catch Throwable t
-                     (reset! failure t)
-                     (on-error t)
-                     t)
-                   (finally
-                     (async/close! sub-chan))))]
+        worker (run-persisted-view! acc binding-pairs sub-chan stop-chan failure opts)]
     (reify
       clojure.lang.IDeref
       (deref [_]
