@@ -207,7 +207,10 @@
 
   Once failed, deref rethrows the failure. Recover by closing the
   view and starting a new one: it resumes after the accumulator's last
-  committed sequence number."
+  committed sequence number.
+
+  Closing flushes the uncommitted events, then closes the accumulator
+  if it is an AutoCloseable. Closing more than once is a no-op."
   [event-store binding-pairs acc & opts]
   (when-not (p/persisted-accumulator? acc)
     (throw (ex-info "acc must be a PersistedAccumulator" {})))
@@ -217,6 +220,7 @@
         sub-chan (subscribe-persisted-view event-store binding-pairs start-sequence)
         stop-chan (async/chan 1)
         failure (atom nil)
+        closed? (atom false)
         worker (run-persisted-view! acc binding-pairs sub-chan stop-chan failure opts)]
     (reify
       clojure.lang.IDeref
@@ -227,9 +231,10 @@
 
       java.lang.AutoCloseable
       (close [_]
-        (async/close! stop-chan)
-        (async/alt!!
-          worker :done
-          (async/timeout 5000) :timeout)
-        (when (instance? java.lang.AutoCloseable acc)
-          (.close acc))))))
+        (when (compare-and-set! closed? false true)
+          (async/close! stop-chan)
+          (async/alt!!
+            worker :done
+            (async/timeout 5000) :timeout)
+          (when (instance? java.lang.AutoCloseable acc)
+            (.close acc)))))))

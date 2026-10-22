@@ -63,24 +63,34 @@
 (def ^:private run-view! #'v/run-persisted-view!)
 
 (defn- stub-acc
-  "A PersistedAccumulator recording what was committed.
+  "A PersistedAccumulator recording what was committed, and the order
+  of commits and close in :log.
+
+  last-sequence is the sequence number of a previous run, if any.
 
   commit-fn is called first in -tx-commit with the sequence number. It
   may throw to simulate a failing commit, which leaves the open
   transaction intact."
-  [& {:keys [commit-fn] :or {commit-fn (fn [_])}}]
+  [& {:keys [commit-fn last-sequence] :or {commit-fn (fn [_])}}]
   (let [ops (atom [])
-        commits (atom [])]
+        commits (atom [])
+        log (atom [])]
     {:ops ops
      :commits commits
-     :acc (reify p/PersistedAccumulator
-            (-sequence-number [_] (:sequence (peek @commits)))
+     :log log
+     :acc (reify
+            p/PersistedAccumulator
+            (-sequence-number [_] (or (:sequence (peek @commits)) last-sequence))
             (-tx-append [this op] (swap! ops conj op) this)
             (-tx-commit [_ sequence-number]
               (commit-fn sequence-number)
               (swap! commits conj {:sequence sequence-number :ops @ops})
+              (swap! log conj [:commit sequence-number])
               (reset! ops []))
-            (-reset [this] this))}))
+            (-reset [this] this)
+
+            java.lang.AutoCloseable
+            (close [_] (swap! log conj :close)))}))
 
 (defn- ev
   [n]
@@ -239,3 +249,133 @@
         (is (re-find #"closed unexpectedly" (ex-message ex)))
         (is (identical? ex @failure))
         (is (= [ex] @errors))))))
+
+;; persisted-view* is tested against a stub event store, which records
+;; how it is subscribed to and hands out a channel for the test to feed.
+
+(defn- stub-event-store
+  "An event store that only supports -subscribe. The subscriptions
+  made are recorded in :calls. It returns sub-chan, or throws
+  subscribe-error if given."
+  [sub-chan & {:keys [subscribe-error]}]
+  (let [calls (atom [])]
+    {:calls calls
+     :event-store (with-meta {}
+                    {`p/-subscribe (fn [_ query opts]
+                                     (swap! calls conj {:query query :opts opts})
+                                     (when subscribe-error
+                                       (throw subscribe-error))
+                                     sub-chan)})}))
+
+(defn- close!
+  [view]
+  (.close ^java.lang.AutoCloseable view))
+
+(defn- failed?
+  [view]
+  (try
+    @view
+    false
+    (catch clojure.lang.ExceptionInfo _
+      true)))
+
+(deftest persisted-view*-test
+  (testing "rejects an accumulator that is not a PersistedAccumulator"
+    (let [{:keys [event-store]} (stub-event-store (async/chan))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a PersistedAccumulator"
+                            (v/persisted-view* event-store append-num-pairs {})))))
+
+  (testing "subscribes from the start for a fresh accumulator"
+    (let [{:keys [acc]} (stub-acc)
+          {:keys [event-store calls]} (stub-event-store (async/chan))]
+      (with-open [_ (v/persisted-view* event-store append-num-pairs acc)]
+        (is (= [{:start-sequence 0}] (map :opts @calls))))))
+
+  (testing "resumes after the last sequence number of the accumulator"
+    (let [{:keys [acc]} (stub-acc :last-sequence 41)
+          {:keys [event-store calls]} (stub-event-store (async/chan))]
+      (with-open [_ (v/persisted-view* event-store append-num-pairs acc)]
+        (is (= [{:start-sequence 42}] (map :opts @calls))))))
+
+  (testing "subscribes with one query map per binding pair"
+    (let [{:keys [acc]} (stub-acc)
+          {:keys [event-store calls]} (stub-event-store (async/chan))
+          binding-pairs [[(test-event) (fn [acc _] acc)]
+                         [[(test-event-2) {(e/payload-path :id) "abc-222"}] (fn [acc _] acc)]]]
+      (with-open [_ (v/persisted-view* event-store binding-pairs acc)]
+        (is (= [#{{:event-types #{:test/event}
+                   :tag-bindings {}}
+                  {:event-types #{:test/event-2}
+                   :tag-bindings {(e/payload-path :id) "abc-222"}}}]
+               (map :query @calls))))))
+
+  (testing "a subscribe failure at start is thrown, with the phase"
+    (let [{:keys [acc]} (stub-acc :last-sequence 9)
+          cause (ex-info "store down" {})
+          {:keys [event-store]} (stub-event-store (async/chan) :subscribe-error cause)
+          ex (try
+               (v/persisted-view* event-store append-num-pairs acc)
+               (catch clojure.lang.ExceptionInfo ex ex))]
+      (is (= :subscribe (:phase (ex-data ex))))
+      (is (= 10 (:start-sequence (ex-data ex))))
+      (is (identical? cause (ex-cause ex)))))
+
+  (testing "options are passed on to the worker"
+    (let [{:keys [acc commits]} (stub-acc)
+          sub-chan (async/chan 10)
+          {:keys [event-store]} (stub-event-store sub-chan)]
+      (with-open [_ (v/persisted-view* event-store append-num-pairs acc
+                                       :max-size 1
+                                       :max-ms 60000)]
+        (async/>!! sub-chan (ev 1))
+        (is (await-true #(= [{:sequence 1 :ops [1]}] @commits))))))
+
+  (testing "deref"
+    (testing "returns the accumulator while healthy"
+      (let [{:keys [acc]} (stub-acc)
+            {:keys [event-store]} (stub-event-store (async/chan))]
+        (with-open [view (v/persisted-view* event-store append-num-pairs acc)]
+          (is (identical? acc @view)))))
+
+    (testing "rethrows the failure once the view has failed, and keeps doing so"
+      (let [{:keys [acc]} (stub-acc)
+            sub-chan (async/chan 10)
+            {:keys [event-store]} (stub-event-store sub-chan)]
+        (with-open [view (v/persisted-view* event-store append-num-pairs acc
+                                            :on-error (fn [_]))]
+          (async/>!! sub-chan (assoc (ev 1) :event/type :test/unknown))
+          (is (await-true #(failed? view)))
+          (dotimes [_ 2]
+            (let [ex (try @view (catch clojure.lang.ExceptionInfo ex ex))]
+              (is (= :reduce (:phase (ex-data ex))))))))))
+
+  (testing "close"
+    (testing "flushes what was applied, then closes the accumulator and the subscription"
+      (let [{:keys [acc ops log]} (stub-acc)
+            sub-chan (async/chan 10)
+            {:keys [event-store]} (stub-event-store sub-chan)
+            view (v/persisted-view* event-store append-num-pairs acc :max-ms 60000)]
+        (async/>!! sub-chan (ev 1))
+        (is (await-true #(= [1] @ops)))
+        (close! view)
+        (is (= [[:commit 1] :close] @log))
+        (is (false? (async/put! sub-chan (ev 2))))))
+
+    (testing "is idempotent"
+      (let [{:keys [acc log]} (stub-acc)
+            {:keys [event-store]} (stub-event-store (async/chan))
+            view (v/persisted-view* event-store append-num-pairs acc)]
+        (close! view)
+        (close! view)
+        (is (= [:close] @log))))
+
+    (testing "does not throw the failure, and still closes the accumulator"
+      (let [{:keys [acc log]} (stub-acc)
+            sub-chan (async/chan 10)
+            {:keys [event-store]} (stub-event-store sub-chan)
+            view (v/persisted-view* event-store append-num-pairs acc
+                                    :on-error (fn [_]))]
+        (async/>!! sub-chan (assoc (ev 1) :event/type :test/unknown))
+        (is (await-true #(failed? view)))
+        (close! view)
+        (is (= [:close] @log))))))
