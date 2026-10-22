@@ -41,7 +41,59 @@
                              (test-event-2 {:id "abc-222" :num 5})])
       (is (= 15 (v/view* event-store binding-pairs tag-bindings initial-acc)))
       (is (= 5 (v/view* event-store binding-pairs {(e/payload-path :id) "abc-222"} initial-acc)))
-      (is (= 10 (v/view* event-store binding-pairs {(e/payload-path :id) "abc-123"} initial-acc)))))
+      (is (= 15 (v/view* event-store binding-pairs {(e/payload-path :id) "*"} initial-acc)))))
+  (testing "tag-bindings conflicting with a binding pair's tag-bindings"
+    (let [event-store (store.memory/in-memory-event-store)
+          binding-pairs [[(test-event)
+                          (fn [acc ev]
+                            (+ acc (:num (e/payload ev))))]
+
+                         [[(test-event-2) {(e/payload-path :id) "abc-222"}]
+                          (fn [acc ev]
+                            (- acc (:num (e/payload ev))))]]]
+      (l/append event-store [(test-event {:id "abc-123" :num 10})
+                             (test-event-2 {:id "abc-222" :num 5})])
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflict"
+                            (v/view* event-store binding-pairs {(e/payload-path :id) "abc-123"} 0)))))
+  (testing "tag-bindings narrow binding pairs without tag-bindings of their own"
+    (let [event-store (store.memory/in-memory-event-store)
+          binding-pairs [[(test-event)
+                          (fn [acc ev]
+                            (+ acc (:num (e/payload ev))))]
+
+                         [(test-event-2)
+                          (fn [acc ev]
+                            (- acc (:num (e/payload ev))))]]]
+      (l/append event-store [(test-event {:id "abc-123" :num 10})
+                             (test-event {:id "abc-222" :num 10})
+                             (test-event-2 {:id "abc-222" :num 5})])
+      (is (= 5 (v/view* event-store binding-pairs {(e/payload-path :id) "abc-222"} 0)))))
+  (testing "tag-bindings are only applied to event types having the tag"
+    ;; Only test-event-2 has the metadata :version tag. Without
+    ;; filtering, the query for test-event would be invalid.
+    (let [event-store (store.memory/in-memory-event-store)
+          binding-pairs [[(test-event)
+                          (fn [acc ev]
+                            (+ acc (:num (e/payload ev))))]
+
+                         [(test-event-2)
+                          (fn [acc ev]
+                            (- acc (:num (e/payload ev))))]]]
+      (l/append event-store [(test-event {:id "abc-123" :num 10})
+                             (test-event {:id "abc-222" :num 10})
+                             (test-event-2 {:id "abc-222" :num 5})])
+      (is (= 15 (v/view* event-store binding-pairs {(e/metadata-path :version) 1} 0)))
+      (is (= 20 (v/view* event-store binding-pairs {(e/metadata-path :version) 2} 0)))))
+  (testing "tag-bindings for a tag none of the event types have"
+    (let [event-store (store.memory/in-memory-event-store)
+          binding-pairs [[(test-event)
+                          (fn [acc ev]
+                            (+ acc (:num (e/payload ev))))]]]
+      (l/append event-store [(test-event {:id "abc-123" :num 10})])
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid ledjer query"
+                            (v/view* event-store binding-pairs {(e/payload-path :nope) "x"} 0)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid ledjer query"
+                            (v/view* event-store binding-pairs {(e/metadata-path :version) 1} 0)))))
   (testing "too many matching bindings"
     (let [event-store (store.memory/in-memory-event-store)
           binding-pairs [[(test-event)

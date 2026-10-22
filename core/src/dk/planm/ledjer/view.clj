@@ -41,20 +41,68 @@
       (throw (ex-info "Expected exactly one matching binding pair per event!" {:num-matching (count pairs-matching-type)}))
       (binding-pair-reducer (first pairs-matching-type)))))
 
+(defn- binding-pair-query-tags
+  "The tag bindings to query binding-pair's event type with: the
+  binding pair's own tags, plus those of the runtime tag-bindings that
+  name one of the event type's tags.
+
+  A \"*\" on either side yields to the other. Otherwise, a runtime
+  binding differing from the binding pair's is a conflict and throws."
+  [binding-pair tag-bindings]
+  (let [pair-tags (binding-pair-tags binding-pair)
+        runtime-tags (select-keys tag-bindings
+                                  (event/get-event-tags (binding-pair-type binding-pair)))
+        conflicts (into {}
+                        (filter (fn [[tag v]]
+                                  (and (contains? pair-tags tag)
+                                       (let [pv (get pair-tags tag)]
+                                         (not (or (= pv v) (= "*" pv) (= "*" v)))))))
+                        runtime-tags)]
+    (when (seq conflicts)
+      (throw (ex-info "Tag bindings conflict with binding pair!"
+                      {:event-type (binding-pair-type binding-pair)
+                       :binding-pair-tags pair-tags
+                       :conflicting-tag-bindings conflicts})))
+    (merge-with (fn [runtime-v pair-v] (if (= "*" pair-v) runtime-v pair-v))
+                runtime-tags
+                pair-tags)))
+
+(defn- validate-tag-bindings!
+  "Throw if tag-bindings names a tag that none of binding-pairs' event
+  types have. Such a binding applies to nothing, so is a mistake."
+  [binding-pairs tag-bindings]
+  (let [known (into #{}
+                    (comp (map binding-pair-type)
+                          (mapcat event/get-event-tags))
+                    binding-pairs)
+        unknown (into [] (remove known) (keys tag-bindings))]
+    (when (seq unknown)
+      (throw (ex-info "Invalid ledjer query: tag binding for a tag none of the event types have"
+                      {:event-types (into #{} (map binding-pair-type) binding-pairs)
+                       :unknown-tag-paths unknown})))))
+
 (defn view*
   "Given a map of binding-pairs, either kw -> reducer-fn or [kw
   tag-bindings] -> reducer-fn, and a map of tag-bindings, reduces
   events sourced from event-store to a single value using the
   reducer-fns.
 
+  The tag-bindings narrow each binding pair's query, for the tags the
+  pair's event type has. They must name a tag of at least one of the
+  binding pairs' event types, and must not conflict with the tags bound
+  by a binding pair, or this throws.
+
   Will throw in case an event is sourced for which there is no
   reducer-fn registered."
   [event-store binding-pairs tag-bindings initial-acc]
+  (validate-tag-bindings! binding-pairs tag-bindings)
   (let [events (p/-source event-store
                           (query/validate!
-                           #{{:event-types (into #{} (map binding-pair-type) binding-pairs)
-                              ;; TODO: Bug in :tag-bindings - ignores tag bindings from [kw tag-bindings] -> reducer-fn binding-pairs
-                              :tag-bindings tag-bindings}})
+                           (into #{}
+                                 (map (fn [binding-pair]
+                                        {:event-types #{(binding-pair-type binding-pair)}
+                                         :tag-bindings (binding-pair-query-tags binding-pair tag-bindings)}))
+                                 binding-pairs))
                           {})]
     (reduce
      (fn [acc event]
