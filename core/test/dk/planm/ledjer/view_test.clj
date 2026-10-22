@@ -379,3 +379,81 @@
         (is (await-true #(failed? view)))
         (close! view)
         (is (= [:close] @log))))))
+
+;; persisted-view* with the in-memory event store. The accumulator
+;; stands in for a persisted index: it outlives the views on it.
+
+(defn- await-sequence
+  "Wait for acc to commit up to and including sequence-number."
+  [acc sequence-number]
+  (await-true #(some-> (p/-sequence-number acc) (>= sequence-number))))
+
+(defn- applied
+  "The ops committed to a stub accumulator, in order."
+  [commits]
+  (into [] (mapcat :ops) @commits))
+
+(deftest persisted-view*-in-memory-store
+  (testing "applies existing events, then events as they arrive"
+    (let [event-store (store.memory/in-memory-event-store)
+          {:keys [acc commits]} (stub-acc)]
+      (l/append event-store [(test-event {:id "a" :num 1})
+                             (test-event {:id "b" :num 2})])
+      (with-open [_ (v/persisted-view* event-store append-num-pairs acc :max-ms 50)]
+        (let [position (l/append event-store [(test-event {:id "c" :num 3})])]
+          (is (await-sequence acc position))
+          (is (= [1 2 3] (applied commits)))))))
+
+  (testing "a restarted view resumes where the last one committed, applying every event once"
+    (let [event-store (store.memory/in-memory-event-store)
+          {:keys [acc commits]} (stub-acc)]
+      (l/append event-store [(test-event {:id "a" :num 1})
+                             (test-event {:id "b" :num 2})])
+      (with-open [_ (v/persisted-view* event-store append-num-pairs acc :max-ms 50)]
+        (is (await-sequence acc 2)))
+      ;; Appended while no view was running
+      (l/append event-store [(test-event {:id "c" :num 3})
+                             (test-event {:id "d" :num 4})])
+      (with-open [_ (v/persisted-view* event-store append-num-pairs acc :max-ms 50)]
+        (let [position (l/append event-store [(test-event {:id "e" :num 5})])]
+          (is (await-sequence acc position))))
+      (is (= [1 2 3 4 5] (applied commits)))))
+
+  (testing "a view applies just the events it has binding pairs for"
+    (let [event-store (store.memory/in-memory-event-store)
+          {:keys [acc commits]} (stub-acc)]
+      (with-open [_ (v/persisted-view* event-store append-num-pairs acc :max-ms 50)]
+        (let [position (l/append event-store [(test-event {:id "a" :num 1})
+                                              (test-event-2 {:id "a" :num 2})
+                                              (test-event {:id "a" :num 3})])]
+          (is (await-sequence acc position))
+          (is (= [1 3] (applied commits)))))))
+
+  (testing "tag bindings in binding pairs select the events"
+    (let [event-store (store.memory/in-memory-event-store)
+          {:keys [acc commits]} (stub-acc)
+          binding-pairs [[[(test-event) {(e/payload-path :id) "a"}]
+                          (fn [acc event]
+                            (p/-tx-append acc (:num (e/payload event)))
+                            acc)]]]
+      (l/append event-store [(test-event {:id "a" :num 1})
+                             (test-event {:id "b" :num 2})])
+      (with-open [_ (v/persisted-view* event-store binding-pairs acc :max-ms 50)]
+        (let [position (l/append event-store [(test-event {:id "b" :num 3})
+                                              (test-event {:id "a" :num 4})])]
+          (is (await-sequence acc position))
+          (is (= [1 4] (applied commits)))))))
+
+  (testing "an event that several binding pairs match fails the view"
+    (let [event-store (store.memory/in-memory-event-store)
+          {:keys [acc]} (stub-acc)
+          noop (fn [acc _] acc)
+          binding-pairs [[(test-event) noop]
+                         [[(test-event) {(e/payload-path :id) "a"}] noop]]]
+      (with-open [view (v/persisted-view* event-store binding-pairs acc
+                                          :on-error (fn [_]))]
+        (l/append event-store [(test-event {:id "a" :num 1})])
+        (is (await-true #(failed? view)))
+        (let [ex (try @view (catch clojure.lang.ExceptionInfo ex ex))]
+          (is (= :reduce (:phase (ex-data ex))))
+          (is (re-find #"exactly one matching binding pair" (ex-message (ex-cause ex)))))))))
