@@ -1,10 +1,16 @@
 (ns dk.planm.ledjer.store.umadb-test
-  "Needs a running UmaDB on localhost:50051, e.g.
-  `podman run -p 50051:50051 umadb/umadb:latest`.
+  "Starts UmaDB in a container via Testcontainers, so a Docker-compatible
+  runtime must be available. With Podman, start its socket and point
+  Testcontainers at it:
 
-  The database isn't reset between tests, so they only rely on events
-  they append themselves."
+      systemctl --user start podman.socket
+      export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+      export TESTCONTAINERS_RYUK_DISABLED=true
+
+  One container is shared by all tests in the namespace, so they only
+  rely on events they append themselves."
   (:require
+   [clj-test-containers.core :as tc]
    [clojure.core.async :as async]
    [clojure.test :refer [deftest is testing use-fixtures]]
    [dk.planm.ledjer :as l]
@@ -13,11 +19,33 @@
   (:import
    [io.umadb.client UmaDbClient]))
 
+(def ^:private umadb-port
+  "UmaDB's port inside the container. Testcontainers maps it to a random
+  free host port, so the tests don't clash with a local UmaDB."
+  50051)
+
+(def ^:dynamic *umadb-opts*
+  "Connection options for the running UmaDB container."
+  nil)
+
 (def ^:dynamic *event-store* nil)
+
+(use-fixtures :once
+  (fn [f]
+    (let [container (-> (tc/create {:image-name "docker.io/umadb/umadb:latest"
+                                    :exposed-ports [umadb-port]
+                                    :wait-for {:wait-strategy :port}})
+                        tc/start!)]
+      (try
+        (binding [*umadb-opts* {:host (:host container)
+                                :port (get (:mapped-ports container) umadb-port)}]
+          (f))
+        (finally
+          (tc/stop! container))))))
 
 (use-fixtures :each
   (fn [f]
-    (let [client (store.umadb/umadb-event-store {})]
+    (let [client (store.umadb/umadb-event-store *umadb-opts*)]
       (.connect ^UmaDbClient client)
       (try
         (binding [*event-store* client]
