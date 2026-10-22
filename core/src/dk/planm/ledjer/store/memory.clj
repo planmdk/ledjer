@@ -109,25 +109,86 @@
                                            (< from n (inc to))))))
        (sort-by sequence-num)))
 
+(defn- put-or-closed!
+  "Put val on c, waiting for room in it. Returns false if c is closed.
+
+  Closing c doesn't release a put that is waiting for room, so the wait
+  is cut short regularly to look for that."
+  [c val]
+  (loop []
+    (let [[ret port] (async/alts!! [[c val] (async/timeout 50)] :priority true)]
+      (if (= port c)
+        ret
+        ;; offer! returns nil if there is no room yet, false if closed
+        (let [offered (async/offer! c val)]
+          (if (nil? offered)
+            (recur)
+            offered))))))
+
 (defn- in-memory-subscribe
-  [event-store query]
-  (let [c (async/chan 10)
+  "Subscribe to the events matching query.
+
+  Without :start-sequence in opts, only events appended after
+  subscribing are delivered. With it, the matching events from that
+  sequence number (inclusive) on are delivered first: existing events
+  are replayed on a separate thread, with backpressure, and then the
+  subscription goes live. Events are delivered in order, each once."
+  [event-store query opts]
+  (let [sequence-ref (:last-sequence-number event-store)
+        c (async/chan 10)
         ;; Each subscription needs its own watch key, or they would
         ;; replace each other
-        watch-key (Object.)]
+        watch-key (Object.)
+        lock (Object.)
+        ;; Events up to and including this sequence number have been
+        ;; delivered, or are skipped
+        delivered (volatile! 0)
+        ;; Live subscriptions are delivered to by the watch, on the
+        ;; thread of the append. Until then, the replay delivers.
+        live? (volatile! false)
+        end-subscription! (fn [] (remove-watch sequence-ref watch-key))
+        matching-events (fn [from to]
+                          (filter (fn [event] (some #(matches? event %) query))
+                                  (events-after event-store from to)))
+        deliver-live! (fn []
+                        (locking lock
+                          (when @live?
+                            (let [current @sequence-ref]
+                              (loop [[event & events] (matching-events @delivered current)]
+                                (when event
+                                  (if (async/put! c event)
+                                    (recur events)
+                                    ;; The channel is closed: end the subscription
+                                    (end-subscription!))))
+                              ;; A start sequence in the future leaves
+                              ;; delivered ahead of current
+                              (vswap! delivered max current)))))
+        replay! (fn []
+                  (async/thread
+                    (loop []
+                      (let [current @sequence-ref]
+                        ;; every? stops at the first closed channel
+                        (if (every? #(put-or-closed! c %) (matching-events @delivered current))
+                          (do
+                            (vswap! delivered max current)
+                            ;; Go live, unless events were appended
+                            ;; while replaying
+                            (when-not (locking lock
+                                        (when (= current @sequence-ref)
+                                          (vreset! live? true)))
+                              (recur)))
+                          (end-subscription!))))))]
     ;; A ref's watches are called once per transaction, so one append
     ;; of several events moves the sequence number from previous to
     ;; current in one step: deliver every event in between.
-    (add-watch (:last-sequence-number event-store)
-               watch-key
-               (fn [key sequence-ref previous-sequence-num current-sequence-num]
-                 (loop [[event & events] (events-after event-store previous-sequence-num current-sequence-num)]
-                   (when event
-                     (if (and (some #(matches? event %) query)
-                              (not (async/put! c event)))
-                       ;; The channel is closed: end the subscription
-                       (remove-watch sequence-ref key)
-                       (recur events))))))
+    (add-watch sequence-ref watch-key (fn [_key _ref _previous _current] (deliver-live!)))
+    (if-let [start-sequence (:start-sequence opts)]
+      (do
+        (vreset! delivered (max 0 (dec start-sequence)))
+        (replay!))
+      (locking lock
+        (vreset! delivered @sequence-ref)
+        (vreset! live? true)))
     c))
 
 (defn in-memory-event-store

@@ -127,3 +127,81 @@
       (async/close! c)
       (l/append event-store [(order-placed {:order-id (random-uuid)})])
       (is (= 0 (watch-count event-store))))))
+
+(defn- await-true
+  [pred]
+  (loop [tries 200]
+    (cond
+      (pred) true
+      (zero? tries) false
+      :else (do (Thread/sleep 10)
+                (recur (dec tries))))))
+
+(defn- append-orders!
+  "Append n order-placed events, returns their ids and the position of the last."
+  [event-store n]
+  (let [ids (vec (repeatedly n random-uuid))
+        last-sequence (l/append event-store (mapv #(order-placed {:order-id %}) ids))]
+    {:ids ids
+     :last-sequence last-sequence}))
+
+(deftest subscribe-with-start-sequence
+  (let [query #{{:event-types #{(order-placed)}}}]
+    (testing "replays from the start sequence, inclusive, then continues live"
+      (let [event-store (store.memory/in-memory-event-store)
+            {:keys [ids last-sequence]} (append-orders! event-store 5)
+            ;; The third of the five events
+            c (l/subscribe event-store query {:start-sequence (- last-sequence 2)})
+            live-id (random-uuid)]
+        (l/append event-store [(order-placed {:order-id live-id})])
+        (is (= (conj (subvec ids 2) live-id)
+               (order-ids (receive-all c))))))
+
+    (testing "a start sequence of 0 replays everything"
+      (let [event-store (store.memory/in-memory-event-store)
+            {:keys [ids]} (append-orders! event-store 3)
+            c (l/subscribe event-store query {:start-sequence 0})]
+        (is (= ids (order-ids (receive-all c))))))
+
+    (testing "a start sequence in the future delivers events from that sequence on"
+      (let [event-store (store.memory/in-memory-event-store)
+            _ (append-orders! event-store 1)
+            c (l/subscribe event-store query {:start-sequence 3})
+            {:keys [ids]} (append-orders! event-store 3)]
+        ;; Sequence numbers 2, 3 and 4
+        (is (= (subvec ids 1) (order-ids (receive-all c))))))
+
+    (testing "replayed events are selected by the query like live events"
+      (let [event-store (store.memory/in-memory-event-store)
+            wanted (random-uuid)]
+        (l/append event-store [(order-placed {:order-id wanted})
+                               (order-noted {:order-id (random-uuid) :note "x"})
+                               (order-placed {:order-id (random-uuid)})])
+        (let [tagged-query #{{:event-types #{(order-placed)}
+                              :tag-bindings {(e/payload-path :order-id) wanted}}}
+              c (l/subscribe event-store tagged-query {:start-sequence 0})]
+          (is (= [wanted] (order-ids (receive-all c)))))))
+
+    (testing "replays more events than the channel and its pending puts can hold"
+      (let [event-store (store.memory/in-memory-event-store)
+            {:keys [ids]} (append-orders! event-store 3000)
+            c (l/subscribe event-store query {:start-sequence 0})]
+        (is (= ids (order-ids (receive-all c))))))
+
+    (testing "events appended while replaying are delivered once, in order"
+      (let [event-store (store.memory/in-memory-event-store)
+            {:keys [ids]} (append-orders! event-store 200)
+            c (l/subscribe event-store query {:start-sequence 0})
+            live-ids (vec (repeatedly 20 random-uuid))]
+        (doseq [id live-ids]
+          (l/append event-store [(order-placed {:order-id id})]))
+        (is (= (into ids live-ids) (order-ids (receive-all c))))))
+
+    (testing "closing the channel during replay ends the subscription"
+      (let [event-store (store.memory/in-memory-event-store)
+            _ (append-orders! event-store 100)
+            c (l/subscribe event-store query {:start-sequence 0})]
+        ;; Nothing is taken from c, so the replay is waiting for room
+        (is (= 1 (watch-count event-store)))
+        (async/close! c)
+        (is (await-true #(= 0 (watch-count event-store))))))))
