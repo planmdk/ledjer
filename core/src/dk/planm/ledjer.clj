@@ -8,6 +8,7 @@
   The concepts in Event Modeling map almost directly to concepts in Ledjer:
 
   - state view: (defview ...)
+  - persisted state view: (defpersistedview ...)
   - automation: (automation ...)
   - event: (defevent ...)
   - state change: defn that either fails or appends events
@@ -133,6 +134,27 @@
          ~(vary-meta name merge {:state-view true})
          [event-store# tag-bindings#]
          (dk.planm.ledjer.view/view* event-store# ~binding-pairs-seq tag-bindings# ~initial-acc)))))
+
+(defmacro defpersistedview
+  "Define a persisted view, a function of an event-store, a
+  PersistedAccumulator and optional options (as keyword args).
+
+  Like defview, but instead of reducing to a value on each call, the
+  returned function starts keeping the accumulator up to date from a
+  subscription. It returns a handle that derefs to the accumulator and
+  closes the view. See dk.planm.ledjer.view/persisted-view* for the
+  options and failure semantics.
+
+  The accumulator is passed at call time since it holds external
+  resources, so there is no initial-acc here."
+  {:clj-kondo/lint-as 'clojure.core/def}
+  [name & binding-pairs]
+  (assert (even? (count binding-pairs)) "defpersistedview requires an even number of binding pairs.")
+  (let [binding-pairs-seq (into [] (partitionv 2 binding-pairs))]
+    `(defn
+       ~(vary-meta name merge {:persisted-view true})
+       [event-store# acc# & opts#]
+       (apply dk.planm.ledjer.view/persisted-view* event-store# ~binding-pairs-seq acc# opts#))))
 
 (defn- channel?
   [v]
