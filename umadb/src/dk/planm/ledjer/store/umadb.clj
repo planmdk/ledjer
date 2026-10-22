@@ -5,6 +5,7 @@
    [dk.planm.ledjer.event :as le]
    [dk.planm.ledjer.protocols :as p])
   (:import
+   [io.grpc Context Context$CancellableContext]
    [io.umadb.client
     AppendCondition
     AppendRequest
@@ -114,55 +115,87 @@
             umadb-events (mapcat ReadResponse/.events umadb-read-responses)]
         (mapv uma-event->ledjer-event umadb-events)))))
 
+(defn- put-or-closed!
+  "Put val on c, waiting for room in it. Returns false if c is closed.
+
+  Closing c doesn't release a put that is waiting for room, so the wait
+  is cut short regularly to look for that."
+  [c val]
+  (loop []
+    (let [[ret port] (async/alts!! [[c val] (async/timeout 50)] :priority true)]
+      (if (= port c)
+        ret
+        ;; offer! returns nil if there is no room yet, false if closed
+        (let [offered (async/offer! c val)]
+          (if (nil? offered)
+            (recur)
+            offered))))))
+
 (defn- uma-subscribe*
-  "Feed events matching umadb-query appended after position into c."
-  [^UmaDbClient umadb-client c umadb-query position]
-  (let [umadb-subscribe-request (SubscribeRequest.
+  "Feed events matching umadb-query with a position after `after` into c.
+
+  The client derives each stream's gRPC context from the current one,
+  so the subscription is opened inside a context of our own, which is
+  cancelled to release the stream once c is closed."
+  [^UmaDbClient umadb-client c umadb-query after]
+  (let [^Context$CancellableContext context (.withCancellation (Context/current))
+        umadb-subscribe-request (SubscribeRequest.
                                  umadb-query
-                                 position
+                                 after
                                  nil) ;; default batch size
-        umadb-subscription (.subscribe umadb-client umadb-subscribe-request)]
+        ^java.util.Iterator umadb-subscription
+        (.call context ^java.util.concurrent.Callable
+               (fn [] (.subscribe umadb-client umadb-subscribe-request)))
+        cancelled? (volatile! false)
+        cancel! (fn []
+                  (vreset! cancelled? true)
+                  (.cancel context nil))]
     (async/io-thread
      (loop []
        (when-let [item (try
-                         (.next umadb-subscription)
+                         (when (.hasNext umadb-subscription)
+                           (.next umadb-subscription))
                          (catch Exception e
                            ;; Closing c would make consumers like
                            ;; automations spin on the closed channel,
                            ;; so the error is reported and the
                            ;; subscription just stops. Cancellation is
                            ;; how it ends when the client shuts down.
-                           (when-not (re-find #"CANCELLED" (str (ex-message e)))
+                           (when-not (or @cancelled?
+                                         (re-find #"CANCELLED" (str (ex-message e))))
                              (binding [*out* *err*]
                                (println "UmaDB subscription stopped:" (ex-message e))))
                            nil))]
-         (let [ch-closed? (reduce (fn [chan-closed? umadb-event]
-                                    (if (async/>!! c umadb-event)
-                                      chan-closed?
-                                      (reduced true)))
-                                  false
-                                  (.events ^SubscribeResponse item))]
-           (when-not ch-closed?
-             (recur))))))
+         (if (every? #(put-or-closed! c %) (.events ^SubscribeResponse item))
+           (recur)
+           (cancel!)))))
     c))
 
 (defn- uma-subscribe
-  [^UmaDbClient umadb-client query]
-  (tap> [::uma-subscribe :umadb-client umadb-client])
+  "Subscribe to the events matching query.
+
+  Without :start-sequence in opts, only events appended after
+  subscribing are delivered. With it, the matching events from that
+  sequence number (inclusive) on are delivered first, then the
+  subscription goes live."
+  [^UmaDbClient umadb-client query opts]
   (let [c (async/chan 10 (map uma-event->ledjer-event))
-        head-position (.getHeadPosition umadb-client)
         umadb-query (when query (ledjer-query->uma-query query))]
     (if (and query (nil? umadb-query))
       c ;; no event types, so nothing will ever arrive
-      (uma-subscribe* umadb-client c umadb-query head-position))))
+      (let [after (if-let [start-sequence (:start-sequence opts)]
+                    ;; UmaDB's after is exclusive, and positions start at 1
+                    (max 0 (dec start-sequence))
+                    (.getHeadPosition umadb-client))]
+        (uma-subscribe* umadb-client c umadb-query (long after))))))
 
 (extend-type UmaDbClient
   p/EventStore
   (-source [this query opts]
     (uma-source this query opts))
 
-  (-subscribe [this query]
-    (uma-subscribe this query))
+  (-subscribe [this query opts]
+    (uma-subscribe this query opts))
 
   (-append [this events condition]
     (uma-append this events condition)))
