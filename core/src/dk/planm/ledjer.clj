@@ -24,7 +24,7 @@
    [dk.planm.ledjer.protocols :as p]
    [dk.planm.ledjer.query :as query]
    [dk.planm.ledjer.store.memory :as store.memory]
-   [dk.planm.ledjer.view]
+   [dk.planm.ledjer.view :as view]
    [malli.core :as malli]
    [malli.error :as merror])
   (:import
@@ -231,20 +231,8 @@
             (test/is (= (map (fn [e] (select-keys e #{:event/type :event/payload})) new-events)
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
 
-(defn gt
-  "Given-Then tests whether an automation results in the expected
-  outputs (then) given the input events.
-
-  - automation must be a function returning an automation given an
-  event-store
-
-  - given must be a vector of events
-
-  - then must be a vector of events
-
-  - timeout-ms (optional) controls for how long the test will await
-  the automation before timing out"
-  [& {:keys [automation given then timeout-ms]}]
+(defn- gt-automation
+  [{:keys [automation given then timeout-ms]}]
   (let [event-store (store.memory/in-memory-event-store)
         automation-stop-fn (automation event-store)]
     (try
@@ -267,6 +255,65 @@
           (throw (ex-info "Given-Then timed out." {:timeout-ms timeout-ms}))))
       (finally
         (automation-stop-fn)))))
+
+(defn- gt-persisted-view
+  [{view-var :view :keys [acc opts given then timeout-ms]}]
+  (assert (and (var? view-var) (:persisted-view (meta view-var)))
+          "The :view must be the var of a persisted view (see defpersistedview). Did you forget to prepend #'?")
+  (assert (fn? then) "The :then must be a predicate of the view's accumulator.")
+  (assert (p/persisted-accumulator? acc) "The :acc must be a PersistedAccumulator.")
+  (assert (nil? (p/-sequence-number acc)) "The :acc must be fresh. Create it per test.")
+  (let [event-store (store.memory/in-memory-event-store)
+        opts (merge {:max-ms 10
+                     ;; Failures are rethrown by await-position and deref
+                     :on-error (fn [_])}
+                    opts)]
+    (with-open [v (apply view-var event-store acc (mapcat identity opts))]
+      (let [position (append event-store given)]
+        (view/await-position v position :timeout-ms (or timeout-ms 1000))
+        (test/is (then @v) "The persisted view's accumulator does not satisfy :then.")))))
+
+(defn gt
+  "Given-Then tests whether an automation or a persisted view results
+  in the expected outputs (then) given the input events (given).
+  Exactly one of automation and view must be given.
+
+  For an automation:
+
+  - automation must be a function returning an automation given an
+  event-store
+
+  - given must be a vector of events
+
+  - then must be a vector of events
+
+  - timeout-ms (optional) controls for how long the test will await
+  the automation before timing out
+
+  For a persisted view:
+
+  - view must be the var of a persisted view (see defpersistedview)
+
+  - acc must be a fresh PersistedAccumulator, created per test. It is
+  the accumulator the view is used with in production, so that then
+  can query it. The view closes it when done.
+
+  - opts (optional) is a map of persisted view options. Defaults to a
+  max-ms of 10.
+
+  - given must be a vector of events
+
+  - then must be a predicate of the accumulator, run once the view
+  has committed every given event it applies
+
+  - timeout-ms (optional) controls for how long the test will await
+  the view before timing out"
+  [& {:keys [automation view] :as args}]
+  (assert (not= (some? automation) (some? view))
+          "gt requires exactly one of :automation and :view.")
+  (if view
+    (gt-persisted-view args)
+    (gt-automation args)))
 
 (comment
 

@@ -496,6 +496,26 @@
           (is (await-sequence acc position))
           (is (= [1 4] (applied commits)))))))
 
+  (testing "await-position waits for the commit of the last applied event"
+    (let [event-store (store.memory/in-memory-event-store)
+          {:keys [acc commits]} (stub-acc)]
+      (with-open [view (v/persisted-view* event-store append-num-pairs acc :max-ms 50)]
+        (let [position (l/append event-store [(test-event {:id "a" :num 1})
+                                              (test-event-2 {:id "a" :num 2})])]
+          (v/await-position view position)
+          (is (= [1] (applied commits)))))))
+
+  (testing "await-position times out when the view doesn't commit in time"
+    (let [event-store (store.memory/in-memory-event-store)
+          {:keys [acc]} (stub-acc)]
+      (with-open [view (v/persisted-view* event-store append-num-pairs acc :max-ms 60000)]
+        (let [position (l/append event-store [(test-event {:id "a" :num 1})])
+              ex (try (v/await-position view position :timeout-ms 100)
+                      nil
+                      (catch clojure.lang.ExceptionInfo ex ex))]
+          (is (= :await (:phase (ex-data ex))))
+          (is (= 1 (:target-sequence (ex-data ex))))))))
+
   (testing "an event that several binding pairs match fails the view"
     (let [event-store (store.memory/in-memory-event-store)
           {:keys [acc]} (stub-acc)

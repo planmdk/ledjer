@@ -150,17 +150,22 @@
           (Thread/sleep (long backoff))
           (recur (inc attempt) (* 2 backoff)))))))
 
+(defn- persisted-view-query
+  "The query for the events that binding-pairs apply to."
+  [binding-pairs]
+  (query/validate!
+   (into #{}
+         (map (fn [binding-pair]
+                {:event-types #{(binding-pair-type binding-pair)}
+                 :tag-bindings (binding-pair-tags binding-pair)}))
+         binding-pairs)))
+
 (defn- subscribe-persisted-view
   "Subscribe to the events that binding-pairs apply to, starting at
   start-sequence. Returns the subscription channel. Failures are
   rethrown as ex-info with `:phase :subscribe`."
   [event-store binding-pairs start-sequence]
-  (let [sub-query (query/validate!
-                   (into #{}
-                         (map (fn [binding-pair]
-                                {:event-types #{(binding-pair-type binding-pair)}
-                                 :tag-bindings (binding-pair-tags binding-pair)}))
-                         binding-pairs))]
+  (let [sub-query (persisted-view-query binding-pairs)]
     (try
       (p/-subscribe event-store sub-query {:start-sequence start-sequence})
       (catch Throwable t
@@ -227,6 +232,37 @@
         (finally
           (async/close! sub-chan))))))
 
+(defprotocol PersistedView
+  (-await-position [view position timeout-ms]))
+
+(defn await-position
+  "Block until view has committed every event it applies up to and
+  including the event store position, e.g. as returned by append.
+  Returns immediately if position is nil, or none of the events up to
+  it are applied by the view.
+
+  Options:
+
+  - timeout-ms: how long to wait before throwing (default 1000)
+
+  Throws the view's failure if it fails while waiting, and ex-info
+  with `:phase :await` if the wait times out."
+  [view position & {:keys [timeout-ms] :or {timeout-ms 1000}}]
+  (-await-position view position timeout-ms))
+
+(defn- last-applied-position
+  "The sequence number of the last event up to and including position
+  that binding-pairs apply to and acc has not committed, or nil."
+  [event-store binding-pairs acc position]
+  (let [committed (p/-sequence-number acc)]
+    (transduce (comp (map (comp :sequence event/metadata))
+                     (filter #(<= % position)))
+               (completing (fn [a b] (if a (max a b) b)))
+               nil
+               (p/-source event-store
+                          (persisted-view-query binding-pairs)
+                          {:start-sequence (if committed (inc committed) 0)}))))
+
 (defn persisted-view*
   "Keeps `acc` up to date with the events matching `binding-pairs`
   using a subscription on `event-store`, committing to `acc` every
@@ -253,6 +289,9 @@
   threw. Never skipped.
   - :commit: committing failed after retries.
 
+  Use await-position to wait for the view to catch up with a position
+  in the event store.
+
   Once failed, deref rethrows the failure. Recover by closing the
   view and starting a new one: it resumes after the accumulator's last
   committed sequence number.
@@ -276,6 +315,26 @@
         (when @failure
           (throw @failure))
         acc)
+
+      PersistedView
+      (-await-position [_ position timeout-ms]
+        (when-let [target (some->> position
+                                   (last-applied-position event-store binding-pairs acc))]
+          (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+            (loop []
+              (when-let [t @failure]
+                (throw t))
+              (cond
+                (some-> (p/-sequence-number acc) (>= target)) nil
+                (> (System/currentTimeMillis) deadline)
+                (throw (ex-info "Timed out awaiting persisted view position"
+                                {:phase :await
+                                 :position position
+                                 :target-sequence target
+                                 :committed-sequence (p/-sequence-number acc)
+                                 :timeout-ms timeout-ms}))
+                :else (do (Thread/sleep 10)
+                          (recur)))))))
 
       java.lang.AutoCloseable
       (close [_]

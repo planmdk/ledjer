@@ -24,6 +24,9 @@ Must not do IO!")
     "Commit the appended transaction ops along with the
 sequence-number of the last handled event.
 
+Once this returns, the committed state must be readable, and
+`-sequence-number` must return sequence-number.
+
 If this throws, the open transaction must be left intact: the
 caller may retry the commit with the same sequence-number.")
 
