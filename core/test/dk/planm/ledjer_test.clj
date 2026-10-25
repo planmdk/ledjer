@@ -15,6 +15,60 @@
   :schema [:map [:id :string]]
   :tags [(e/payload-path :id)])
 
+(defn- report-types
+  "Run f, returning the types of the clojure.test reports it made."
+  [f]
+  (let [reports (atom [])]
+    (binding [test/report (fn [m] (swap! reports conj (:type m)))]
+      (f))
+    @reports))
+
+(l/defevent reacted
+  :type :ledjer-test/reacted
+  :schema [:map [:id :string]]
+  :tags [(e/payload-path :id)])
+
+(defn- react-immediately
+  "An automation appending a reacted event as soon as a counted event
+  arrives."
+  [event-store]
+  (l/automation event-store
+                #{(counted)}
+                (fn [event-store]
+                  (l/append event-store [(reacted {:id "a"})]))))
+
+(deftest gt-automation
+  (testing "the reaction of an automation"
+    (is (= [:pass]
+           (report-types
+            #(l/gt :automation react-immediately
+                   :given [(counted {:id "a" :num 1})]
+                   :then [(reacted {:id "a"})])))))
+
+  (testing "a reaction appended before gt subscribes for then is seen"
+    ;; Delaying subscribe gives the automation time to react between
+    ;; the append of given and gt subscribing for then. The automation
+    ;; subscribes before given is appended, so the delay doesn't affect
+    ;; it. A subscription for then from the current position would
+    ;; miss the reaction.
+    (let [subscribe l/subscribe]
+      (with-redefs [l/subscribe (fn [& args]
+                                  (Thread/sleep 100)
+                                  (apply subscribe args))]
+        (is (= [:pass]
+               (report-types
+                #(l/gt :automation react-immediately
+                       :given [(counted {:id "a" :num 1})]
+                       :then [(reacted {:id "a"})]
+                       :timeout-ms 500)))))))
+
+  (testing "no given events"
+    (is (= []
+           (report-types
+            #(l/gt :automation react-immediately
+                   :given []
+                   :then []))))))
+
 (defn- totals-acc
   "A PersistedAccumulator of totals per id, with a query fn, total.
   Ops are applied to the totals only on commit."
@@ -50,14 +104,6 @@
 (l/defpersistedview failing-view
   (counted)
   (fn [_ _] (throw (ex-info "Boom" {}))))
-
-(defn- report-types
-  "Run f, returning the types of the clojure.test reports it made."
-  [f]
-  (let [reports (atom [])]
-    (binding [test/report (fn [m] (swap! reports conj (:type m)))]
-      (f))
-    @reports))
 
 (deftest gt-persisted-view
   (testing "passes when the accumulator satisfies then"

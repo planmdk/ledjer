@@ -232,27 +232,36 @@
                         (map (fn [e] (select-keys e #{:event/type :event/payload})) then)))))))))
 
 (defn- gt-automation
-  [{:keys [automation given then timeout-ms]}]
+  [{:keys [automation given then timeout-ms] :or {timeout-ms 1000}}]
   (let [event-store (store.memory/in-memory-event-store)
         automation-stop-fn (automation event-store)]
     (try
-      (append event-store given)
-      (let [timeout-ch (async/timeout (or timeout-ms 1000))
-            new-events-ch (async/take
-                           (count then)
-                           (subscribe event-store #{{:event-types (into #{} (map event/event-type then))}}))
-            go-ch (async/go-loop [[t & thens] then
-                                  ev (async/<! new-events-ch)]
-                    (when ev
-                      (test/is (= (select-keys ev #{:event/type :event/payload})
-                                  (select-keys t #{:event/type :event/payload})))
-                      (when (seq thens)
-                        (recur thens (async/<! new-events-ch)))))]
-        (when (= :timed-out
-                 (async/alt!!
-                   timeout-ch :timed-out
-                   go-ch :ran))
-          (throw (ex-info "Given-Then timed out." {:timeout-ms timeout-ms}))))
+      (let [last-appended-sequence-num (append event-store given)
+            subscription-start-sequence (if last-appended-sequence-num
+                                          (inc last-appended-sequence-num)
+                                          0)
+            sub-ch (subscribe event-store
+                              #{{:event-types (into #{} (map event/event-type then))}}
+                              {:start-sequence subscription-start-sequence})]
+        (try
+          (let [timeout-ch (async/timeout timeout-ms)
+                new-events-ch (async/take (count then) sub-ch)
+                go-ch (async/go-loop [[t & thens] then
+                                      ev (async/<! new-events-ch)]
+                        (when ev
+                          (test/is (= (select-keys ev #{:event/type :event/payload})
+                                      (select-keys t #{:event/type :event/payload})))
+                          (when (seq thens)
+                            (recur thens (async/<! new-events-ch)))))]
+            (when (= :timed-out
+                     (async/alt!!
+                       timeout-ch :timed-out
+                       go-ch :ran))
+              (throw (ex-info "Given-Then timed out." {:timeout-ms timeout-ms}))))
+          (finally
+            ;; take doesn't close its source. Closing the subscription
+            ;; releases the store's delivery to it.
+            (async/close! sub-ch))))
       (finally
         (automation-stop-fn)))))
 
