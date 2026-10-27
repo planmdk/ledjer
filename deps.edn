@@ -1,8 +1,8 @@
 ;; Development-only deps.edn. Library consumers should depend on the
 ;; sub-projects (core/, umadb/) via :deps/root instead.
 {:paths []
- :deps {io.github.planmdk/ledjer {:local/root "core"}
-        io.github.planmdk/ledjer-umadb {:local/root "umadb"}}
+ :deps {dk.planm/ledjer {:local/root "core"}
+        dk.planm/ledjer-umadb {:local/root "umadb"}}
  :aliases
  {:nrepl {:extra-paths ["core/test" "umadb/test"]
           :extra-deps {cider/cider-nrepl {:mvn/version "0.55.7"}

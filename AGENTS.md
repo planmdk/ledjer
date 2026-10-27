@@ -8,7 +8,7 @@ users can depend on just the core stores or add optional store backends.
 ```
 ledjer/
 ├── deps.edn                 # dev-only: both sub-projects as :local/root
-├── core/                    # io.github.planmdk/ledjer
+├── core/                    # dk.planm/ledjer
 │   ├── deps.edn
 │   ├── src/dk/planm/
 │   │   ├── ledjer.clj
@@ -16,7 +16,7 @@ ledjer/
 │   │       ├── ...
 │   │       └── store/memory.clj
 │   └── test/dk/planm/ledjer/
-├── umadb/                   # io.github.planmdk/ledjer-umadb
+├── umadb/                   # dk.planm/ledjer-umadb
 │   ├── deps.edn             # depends on core via {:local/root "../core"}
 │   ├── src/dk/planm/ledjer/store/umadb.clj
 │   └── test/dk/planm/ledjer/store/
@@ -56,19 +56,19 @@ Both coordinates must point at the same git sha:
 
 ```clojure
 ;; core only
-io.github.planmdk/ledjer {:git/url "https://github.com/planmdk/ledjer"
-                          :git/sha "..." :deps/root "core"}
+dk.planm/ledjer {:git/url "https://github.com/planmdk/ledjer"
+                 :git/sha "..." :deps/root "core"}
 ;; core + UmaDB (pulls in core automatically)
-io.github.planmdk/ledjer-umadb {:git/url "https://github.com/planmdk/ledjer"
-                                :git/sha "..." :deps/root "umadb"}
+dk.planm/ledjer-umadb {:git/url "https://github.com/planmdk/ledjer"
+                       :git/sha "..." :deps/root "umadb"}
 ```
 
 ## Adding a New Store Backend
 
-1. Create `<name>/deps.edn` with `io.github.planmdk/ledjer {:local/root "../core"}`
+1. Create `<name>/deps.edn` with `dk.planm/ledjer {:local/root "../core"}`
    plus the backend's own dependencies, `:paths ["src"]`, and a `:test` alias.
 2. Put sources under `<name>/src/dk/planm/ledjer/store/`.
-3. Register it in the root `deps.edn` as `io.github.planmdk/ledjer-<name>`
+3. Register it in the root `deps.edn` as `dk.planm/ledjer-<name>`
    with `{:local/root "<name>"}`, and add its `test` path to the `:nrepl` and
    `:test` aliases.
 

@@ -1,5 +1,5 @@
 {:paths ["src"]
- :deps {io.github.planmdk/ledjer {:local/root "../core"}
+ :deps {dk.planm/ledjer {:local/root "../core"}
         com.github.igrishaev/deed-core {:mvn/version "0.1.0"}
         io.github.domenicdev/umadb-java-client {:mvn/version "0.7"}}
  :aliases
